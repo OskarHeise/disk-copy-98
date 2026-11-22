@@ -6,6 +6,7 @@ use std::{
         io::{AsRawHandle, RawHandle},
     },
     path::{Component, Path, PathBuf, Prefix},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[link(name = "kernel32")]
@@ -180,6 +181,52 @@ fn source_metadata(root: &Path, path: &Path) -> io::Result<Metadata> {
         ));
     }
     Ok(metadata)
+}
+
+#[derive(Default)]
+pub struct SizeEstimate {
+    pub bytes: u64,
+    pub incomplete: bool,
+}
+
+impl SizeEstimate {
+    fn add(&mut self, path: &Path, metadata: io::Result<Metadata>, cancelled: &AtomicBool) {
+        let Ok(metadata) = metadata else {
+            self.incomplete = true;
+            return;
+        };
+        if is_link(&metadata) {
+            return;
+        }
+        if metadata.is_file() {
+            self.bytes = self.bytes.saturating_add(metadata.len());
+        } else if metadata.is_dir() {
+            let Ok(entries) = fs::read_dir(path) else {
+                self.incomplete = true;
+                return;
+            };
+            for entry in entries {
+                if cancelled.load(Ordering::Relaxed) {
+                    return;
+                }
+                match entry {
+                    Ok(entry) => self.add(&entry.path(), entry.metadata(), cancelled),
+                    Err(_) => self.incomplete = true,
+                }
+            }
+        }
+    }
+}
+
+pub fn selection_size(root: &Path, selected: &[PathBuf], cancelled: &AtomicBool) -> SizeEstimate {
+    let mut size = SizeEstimate::default();
+    for path in selected {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
+        size.add(path, source_metadata(root, path), cancelled);
+    }
+    size
 }
 
 fn normalized(path: &Path) -> PathBuf {
@@ -633,6 +680,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn selection_size_counts_nested_file_bytes() -> io::Result<()> {
+        let fixture = Fixture::new("selection-size")?;
+        let folder = fixture.0.join("folder");
+        let nested = folder.join("nested");
+        let file = fixture.0.join("selected.txt");
+        fs::create_dir_all(&nested)?;
+        fs::create_dir(folder.join("empty"))?;
+        fs::write(nested.join("inside.txt"), b"12345")?;
+        fs::write(&file, b"123")?;
+        fs::write(fixture.0.join("ignored.txt"), b"ignored")?;
+
+        let cancelled = AtomicBool::new(false);
+        let size = selection_size(&fixture.0, &[folder, file.clone()], &cancelled);
+        assert_eq!(size.bytes, 8);
+        assert!(!size.incomplete);
+
+        let size = selection_size(&file, std::slice::from_ref(&file), &cancelled);
+        assert_eq!(size.bytes, 3);
+        assert!(!size.incomplete);
+        Ok(())
+    }
+
+    #[test]
+    fn selection_size_reports_missing_items() -> io::Result<()> {
+        let fixture = Fixture::new("incomplete-size")?;
+        let file = fixture.0.join("selected.txt");
+        fs::write(&file, b"123")?;
+
+        let size = selection_size(
+            &fixture.0,
+            &[fixture.0.join("removed.txt"), file],
+            &AtomicBool::new(false),
+        );
+        assert_eq!(size.bytes, 3);
+        assert!(size.incomplete);
+        Ok(())
     }
 
     #[test]

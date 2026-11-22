@@ -16,9 +16,11 @@ use std::{
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     sync::{
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, TryRecvError},
         Arc, Mutex,
     },
+    thread::JoinHandle,
 };
 use theme::{Theme, FILES_TOP, FOOTER_HEIGHT, MARGIN};
 use win32::*;
@@ -48,6 +50,15 @@ const MIN_WIDTH: i32 = 700;
 const MIN_HEIGHT: i32 = 600;
 const JOB_TIMER: usize = 1;
 const DEVICE_TIMER: usize = 2;
+const SELECTION_SIZE_TIMER: usize = 3;
+
+#[derive(Default)]
+enum SelectionSize {
+    #[default]
+    Pending,
+    Measured(copy::SizeEstimate),
+    Unavailable,
+}
 
 #[derive(Default)]
 struct Browser {
@@ -55,6 +66,7 @@ struct Browser {
     directory: PathBuf,
     entries: Vec<Entry>,
     selected: BTreeSet<PathBuf>,
+    selection_size: SelectionSize,
 }
 
 impl Browser {
@@ -69,6 +81,29 @@ impl Browser {
     fn check(&mut self, path: PathBuf) {
         self.selected.retain(|item| !item.starts_with(&path));
         self.selected.insert(path);
+    }
+
+    fn selection_summary(&self) -> String {
+        let visible = self.entries.len();
+        let count = self.selected.len();
+        if count == 0 {
+            return format!("{visible} visibili  /  0 con spunta");
+        }
+        let size = match &self.selection_size {
+            SelectionSize::Pending => "Calcolo dimensione…".into(),
+            SelectionSize::Measured(size) if !size.incomplete => {
+                display_selection_bytes(size.bytes)
+            }
+            SelectionSize::Measured(size) if size.bytes > 0 => {
+                format!("{} (parziale)", display_selection_bytes(size.bytes))
+            }
+            _ => "Dimensione non disponibile".into(),
+        };
+        if self.inside_selection() {
+            format!("{count} con spunta · {size} · Cartella già inclusa. Risali per modificare le spunte.")
+        } else {
+            format!("{visible} visibili  /  {count} con spunta · {size}")
+        }
     }
 }
 
@@ -113,11 +148,13 @@ enum TaskResult {
 }
 
 type TransferProgress = Arc<Mutex<Option<copy::Progress>>>;
+type SizeTask = (Arc<AtomicBool>, JoinHandle<copy::SizeEstimate>);
 
 thread_local! {
     static UI: RefCell<Browser> = RefCell::new(Browser::default());
     static THEME: RefCell<Option<Theme>> = const { RefCell::new(None) };
     static JOB: RefCell<Option<Receiver<TaskResult>>> = const { RefCell::new(None) };
+    static SIZE_TASK: RefCell<Option<SizeTask>> = const { RefCell::new(None) };
     static ACTIVE_PROGRESS: RefCell<Option<(Operation, TransferProgress)>> = const { RefCell::new(None) };
     static REDRAW_LIST: Cell<bool> = const { Cell::new(false) };
     static SETTING_PATHS: Cell<bool> = const { Cell::new(false) };
@@ -372,8 +409,7 @@ unsafe fn set_path(window: Handle, id: i32, path: &Path) {
     SetWindowTextW(GetDlgItem(window, id), value.as_ptr());
     SETTING_PATHS.set(false);
     if id == SOURCE {
-        UI.with(|ui| ui.replace(Browser::default()));
-        update_view(window);
+        replace_browser(window, Browser::default());
     }
 }
 
@@ -472,8 +508,7 @@ unsafe fn refresh_drives(window: Handle, choose: bool, result: io::Result<disks:
     add_volumes(window, 0);
     SETTING_PATHS.set(false);
     if source != new_source {
-        UI.with(|ui| ui.replace(Browser::default()));
-        update_view(window);
+        replace_browser(window, Browser::default());
     }
     if failed && (choose || removed) {
         status(window, "Inventario dei dischi fisici non disponibile. Puoi usare le unità con lettera o digitare un percorso.");
@@ -603,6 +638,14 @@ unsafe fn choose_disk_item(window: Handle, id: i32, combo: Handle) {
 
 unsafe fn eject_linux(window: Handle, exit: bool) {
     let disks = MOUNTED_DISKS.with(|disks| disks.take());
+    if UI.with_borrow(|ui| {
+        disks
+            .iter()
+            .flat_map(|disk| &disk.volumes)
+            .any(|volume| ui.root.starts_with(&volume.path))
+    }) {
+        queue_selection_size(window);
+    }
     launch(
         window,
         Some("Smontaggio sicuro dei dischi Linux in corso…"),
@@ -718,6 +761,9 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
     let keep_both = SendMessageW(GetDlgItem(window, KEEP_BOTH), BM_GETCHECK, 0, 0) == 1;
     let progress: TransferProgress = Arc::new(Mutex::new(None));
     let worker_progress = Arc::clone(&progress);
+    if moving {
+        queue_selection_size(window);
+    }
     launch(
         window,
         Some(if moving {
@@ -802,6 +848,81 @@ fn display_bytes(bytes: u64) -> String {
     }
 }
 
+fn display_selection_bytes(bytes: u64) -> String {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000 * MB;
+    match bytes {
+        0 => "0 MB".into(),
+        1..=9_999 => "< 0,01 MB".into(),
+        bytes if bytes >= GB => format!("{:.2} GB", bytes as f64 / GB as f64).replace('.', ","),
+        bytes => format!("{:.2} MB", bytes as f64 / MB as f64).replace('.', ","),
+    }
+}
+
+unsafe fn queue_selection_size(window: Handle) {
+    let selected = UI.with_borrow_mut(|ui| {
+        ui.selection_size = SelectionSize::Pending;
+        !ui.selected.is_empty()
+    });
+    let running = SIZE_TASK.with_borrow(|task| {
+        if let Some((cancelled, _)) = task {
+            cancelled.store(true, Ordering::Relaxed);
+        }
+        task.is_some()
+    });
+    if selected || running {
+        if SetTimer(window, SELECTION_SIZE_TIMER, 70, null_mut()) == 0 {
+            UI.with_borrow_mut(|ui| ui.selection_size = SelectionSize::Unavailable);
+        }
+    } else {
+        KillTimer(window, SELECTION_SIZE_TIMER);
+    }
+}
+
+unsafe fn poll_selection_size(window: Handle) {
+    let finished = SIZE_TASK.with_borrow_mut(|task| task.take_if(|(_, task)| task.is_finished()));
+    if let Some((cancelled, task)) = finished {
+        if !cancelled.load(Ordering::Relaxed) {
+            let size = task
+                .join()
+                .map_or(SelectionSize::Unavailable, SelectionSize::Measured);
+            UI.with_borrow_mut(|ui| ui.selection_size = size);
+            KillTimer(window, SELECTION_SIZE_TIMER);
+            update_controls(window);
+            return;
+        }
+    }
+    if SIZE_TASK.with_borrow(Option::is_some) || busy() {
+        return;
+    }
+    let request = UI.with_borrow(|ui| {
+        (!ui.selected.is_empty() && matches!(ui.selection_size, SelectionSize::Pending)).then(
+            || {
+                (
+                    ui.root.clone(),
+                    ui.selected.iter().cloned().collect::<Vec<_>>(),
+                )
+            },
+        )
+    });
+    let Some((root, selected)) = request else {
+        KillTimer(window, SELECTION_SIZE_TIMER);
+        return;
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    match std::thread::Builder::new()
+        .spawn(move || copy::selection_size(&root, &selected, &worker_cancelled))
+    {
+        Ok(task) => SIZE_TASK.with_borrow_mut(|current| *current = Some((cancelled, task))),
+        Err(_) => {
+            UI.with_borrow_mut(|ui| ui.selection_size = SelectionSize::Unavailable);
+            KillTimer(window, SELECTION_SIZE_TIMER);
+            update_controls(window);
+        }
+    }
+}
+
 fn readonly_volume(path: &Path) -> bool {
     MOUNTED_DISKS.with_borrow(|disks| {
         disks
@@ -838,6 +959,7 @@ fn refresh_after_move(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>)
                 root,
                 entries,
                 selected,
+                selection_size: SelectionSize::Pending,
             };
         }
     }
@@ -960,7 +1082,9 @@ unsafe fn collect_task(window: Handle) {
             let count = listing.entries.len();
             let readonly = readonly_volume(&listing.root);
             let can_move = linux_move_access(&listing.root).is_some();
-            UI.with_borrow_mut(|ui| {
+            let remeasure = UI.with_borrow_mut(|ui| {
+                let count = ui.selected.len();
+                let same_directory = ui.directory == listing.directory;
                 if ui.root != listing.root {
                     ui.selected.clear();
                 }
@@ -971,7 +1095,11 @@ unsafe fn collect_task(window: Handle) {
                 let visible: BTreeSet<_> = ui.entries.iter().map(|entry| &entry.path).collect();
                 ui.selected
                     .retain(|path| path.parent() != Some(current) || visible.contains(&path));
+                same_directory || count != ui.selected.len()
             });
+            if remeasure {
+                queue_selection_size(window);
+            }
             update_view(window);
             status(
                 window,
@@ -996,8 +1124,7 @@ unsafe fn collect_task(window: Handle) {
             refreshed,
         })) => {
             if let Some(browser) = refreshed {
-                UI.with(|ui| ui.replace(browser));
-                update_view(window);
+                replace_browser(window, browser);
             }
             status(window, &message);
             if finished {
@@ -1015,6 +1142,12 @@ unsafe fn collect_task(window: Handle) {
         _ => status(window, "Operazione interrotta."),
     }
     update_controls(window);
+}
+
+unsafe fn replace_browser(window: Handle, browser: Browser) {
+    UI.with(|ui| ui.replace(browser));
+    queue_selection_size(window);
+    update_view(window);
 }
 
 unsafe fn update_view(window: Handle) {
@@ -1103,7 +1236,7 @@ unsafe fn update_controls(window: Handle) {
     let busy = busy();
     let source = field(window, SOURCE);
     let highlighted = highlighted(window);
-    let (count, visible, can_open, can_up, covered) = UI.with_borrow(|ui| {
+    let (count, visible, can_open, can_up, covered, summary) = UI.with_borrow(|ui| {
         (
             ui.selected.len(),
             ui.entries.len(),
@@ -1112,6 +1245,7 @@ unsafe fn update_controls(window: Handle) {
                 .is_some_and(|entry| entry.directory),
             ui.directory != ui.root,
             ui.inside_selection(),
+            ui.selection_summary(),
         )
     });
     for (id, enabled) in [
@@ -1134,11 +1268,6 @@ unsafe fn update_controls(window: Handle) {
     ] {
         EnableWindow(GetDlgItem(window, id), i32::from(enabled && !busy));
     }
-    let summary = if covered {
-        format!("{count} con spunta · Cartella già inclusa. Risali e togli la spunta per scegliere singoli file.")
-    } else {
-        format!("{visible} visibili  /  {count} con spunta")
-    };
     text(window, SELECTION, &summary);
     text(
         window,
@@ -1171,6 +1300,7 @@ unsafe fn bulk_selection(window: Handle, select: bool) {
             ui.selected.append(&mut visible);
         }
     });
+    queue_selection_size(window);
     update_checks(window);
     update_controls(window);
 }
@@ -1189,16 +1319,21 @@ unsafe fn list_notification(window: Handle, notification: &Notification) -> isiz
                 if change.header.code == -100 {
                     return UI.with_borrow(Browser::inside_selection) as isize;
                 }
-                UI.with_borrow_mut(|ui| {
-                    if let Some(entry) = ui.entries.get(change.item as usize) {
-                        let path = entry.path.clone();
-                        if new == 0x2000 {
-                            ui.check(path);
-                        } else {
-                            ui.selected.remove(&path);
-                        }
+                let changed = UI.with_borrow_mut(|ui| {
+                    let Some(entry) = ui.entries.get(change.item as usize) else {
+                        return false;
+                    };
+                    let path = entry.path.clone();
+                    if new == 0x2000 {
+                        ui.check(path);
+                        true
+                    } else {
+                        ui.selected.remove(&path)
                     }
                 });
+                if changed {
+                    queue_selection_size(window);
+                }
             }
             if change.header.code == -101 {
                 update_controls(window);
@@ -1219,6 +1354,7 @@ unsafe fn help(window: Handle) {
             "Se lo ha trovato Auto disco, premi Mostra file. Usa Espelli WSL prima di scollegarlo.\r\n\r\n",
             "2. Premi Mostra file. Apri una cartella con un doppio clic o con Apri. Usa Su per risalire. ",
             "Le spunte restano attive quando cambi cartella. Spuntare una cartella include tutto il suo contenuto. ",
+            "Sotto l'elenco trovi la dimensione totale degli elementi spuntati in MB o GB. ",
             "Azzera spunte deseleziona tutti gli elementi.\r\n\r\n",
             "3. Copia selezione lascia gli originali al loro posto. Sposta selezione li rimuove dopo il trasferimento. ",
             "Senza spunte, Copia tutto copia l'intera origine. La barra mostra l'avanzamento.\r\n\r\n",
@@ -1285,8 +1421,7 @@ unsafe extern "system" fn procedure(
             } else if !busy() {
                 match (id, code) {
                     (SOURCE, 1 | 5) if !SETTING_PATHS.get() => {
-                        UI.with(|ui| ui.replace(Browser::default()));
-                        update_view(window);
+                        replace_browser(window, Browser::default());
                         let notice = physical_disk(&field(window, SOURCE)).map(|disk| disk.notice);
                         status(
                             window,
@@ -1315,6 +1450,7 @@ unsafe extern "system" fn procedure(
             return list_notification(window, &*(lparam as *const Notification));
         }
         0x113 if wparam == JOB_TIMER => collect_task(window),
+        0x113 if wparam == SELECTION_SIZE_TIMER => poll_selection_size(window),
         0x113 if wparam == DEVICE_TIMER => {
             if !busy() {
                 KillTimer(window, DEVICE_TIMER);
@@ -1397,5 +1533,30 @@ fn main() {
                 DispatchMessageW(&message);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selection_summary_shows_the_total_in_mb_or_gb() {
+        let mut browser = Browser::default();
+        browser.check(PathBuf::from("file.bin"));
+        browser.selection_size = SelectionSize::Measured(copy::SizeEstimate {
+            bytes: 25_000_000,
+            incomplete: false,
+        });
+        assert!(browser.selection_summary().ends_with(" · 25,00 MB"));
+
+        browser.selection_size = SelectionSize::Measured(copy::SizeEstimate {
+            bytes: 1_250_000_000,
+            incomplete: false,
+        });
+        assert!(browser.selection_summary().ends_with(" · 1,25 GB"));
+
+        browser.selected.clear();
+        assert!(browser.selection_summary().ends_with("0 con spunta"));
     }
 }

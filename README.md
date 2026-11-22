@@ -12,7 +12,7 @@ Disk Copy 98 è un’app portatile per copiare e spostare file e cartelle su Win
 
 1. In Esplora file crea o scegli una cartella di destinazione in cui puoi scrivere, per esempio una cartella **DaSamsung** dentro **Documenti**. Aprila e copia il percorso completo dalla barra degli indirizzi.
 2. In Disk Copy 98 scegli **Origine** e **Destinazione** dai menu oppure inserisci i percorsi completi, per esempio `E:\Foto` e `C:\Users\Anna\Documents\DaSamsung`. La destinazione deve esistere e trovarsi fuori dalla cartella di origine. **Auto disco** dà priorità alle unità USB e rimovibili.
-3. Premi **Mostra file**. Entra in una cartella con il doppio clic o con **Apri**. Usa **Su** per risalire. Spunta i file o le cartelle da trasferire. Le spunte restano attive mentre navighi e la spunta su una cartella include il suo contenuto.
+3. Premi **Mostra file**. Entra in una cartella con il doppio clic o con **Apri**. Usa **Su** per risalire. Spunta i file o le cartelle da trasferire. Le spunte restano attive mentre navighi e la spunta su una cartella include il suo contenuto. Sotto l’elenco compare la dimensione totale degli elementi spuntati in **MB** o **GB**.
 4. Scegli l’operazione.
 
    | Comando | Risultato |
