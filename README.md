@@ -10,9 +10,9 @@ Disk Copy 98 è un’app portatile per copiare e spostare file e cartelle su Win
 
 ## Copia e sposta file
 
-1. In Esplora file crea o scegli una cartella di destinazione in cui puoi scrivere, per esempio una cartella **DaSamsung** dentro **Documenti**. Aprila e copia il percorso completo dalla barra degli indirizzi.
-2. In Disk Copy 98 scegli **Origine** e **Destinazione** dai menu oppure inserisci i percorsi completi, per esempio `E:\Foto` e `C:\Users\Anna\Documents\DaSamsung`. La destinazione deve esistere e trovarsi fuori dalla cartella di origine. **Auto disco** dà priorità alle unità USB e rimovibili.
-3. Premi **Mostra file**. Entra in una cartella con il doppio clic o con **Apri**. Usa **Su** per risalire. Spunta i file o le cartelle da trasferire. Le spunte restano attive mentre navighi e la spunta su una cartella include il suo contenuto. Sotto l’elenco compare la dimensione totale degli elementi spuntati in **MB** o **GB**.
+1. Scegli l’unità di **Origine** nel pannello a sinistra e quella di **Destinazione** nel pannello a destra. Puoi anche digitare o incollare un percorso completo e premere **Sfoglia** nel relativo pannello. **Auto disco** dà priorità alle unità USB e rimovibili.
+2. A destra apri la cartella in cui vuoi trasferire i file. Entra con il doppio clic o con **Apri** e usa **Su** per risalire. Il percorso sopra l’elenco indica la cartella di arrivo. La cartella deve essere scrivibile e trovarsi fuori dall’origine.
+3. A sinistra spunta i file o le cartelle da trasferire. Le spunte restano attive mentre navighi e la spunta su una cartella include il suo contenuto. Sotto l’elenco compare la dimensione totale degli elementi spuntati in **MB** o **GB**.
 4. Scegli l’operazione.
 
    | Comando | Risultato |
@@ -21,7 +21,7 @@ Disk Copy 98 è un’app portatile per copiare e spostare file e cartelle su Win
    | **Copia tutto** | Copia l’intera origine quando la selezione è vuota. Usa **Azzera spunte** per tornare a questa modalità. |
    | **Sposta selezione** | Chiede conferma. Rimuove ciascun file dall’origine dopo averlo scritto nella destinazione. |
 
-5. Attendi il riepilogo. La barra mostra la percentuale elaborata e il testo sotto la barra indica quanti byte sono stati scritti. Poi apri la destinazione in Esplora file per controllare il risultato.
+5. Attendi il riepilogo. La barra mostra la percentuale elaborata e il testo sotto la barra indica quanti byte sono stati scritti. Il pannello a destra si aggiorna dopo il trasferimento.
 
 L’app conserva i percorsi relativi. Se in `E:\Foto` selezioni `2025\Vacanze\mare.jpg`, nella destinazione troverai la stessa sottocartella `2025\Vacanze`. **Help** o **F1** aprono la guida nell’app.
 
@@ -71,10 +71,10 @@ winget install --interactive --exact --id dorssel.usbipd-win
 ## Usa un disco Linux o RAW
 
 1. Collega il disco. Se Windows propone di inizializzarlo o formattarlo e vuoi conservare i dati, annulla la richiesta.
-2. Nell’app scegli il disco fisico in **Origine**. Se **Auto disco** lo ha già selezionato, premi **Mostra file**. Per scrivere su un volume Linux compatibile, puoi scegliere il disco in **Destinazione**.
+2. Nell’app scegli il disco fisico in **Origine**. Se **Auto disco** lo ha già selezionato, premi **Sfoglia** a sinistra. Per scrivere su un volume Linux compatibile, puoi scegliere il disco in **Destinazione** e aprire la cartella di arrivo nel pannello a destra.
 3. Attendi il collegamento a WSL. Un disco USB viene assegnato temporaneamente a Linux tramite usbipd-win. Per gli altri dischi supportati l’app usa il montaggio di WSL e Windows può chiedere l’autorizzazione amministrativa. Se il disco espone più volumi, scegli quello desiderato dal menu. [Montaggio dei dischi in WSL 2](https://learn.microsoft.com/it-it/windows/wsl/wsl2-mount-disk)
 4. Per trasferire file dal disco a Windows, indica una cartella scrivibile su **C:**, seleziona gli elementi e scegli **Copia selezione** o **Sposta selezione**. Le opzioni dipendono dalla possibilità di scrivere sul volume.
-5. Al termine premi **Espelli WSL** e attendi il messaggio di smontaggio prima di scollegare il cavo. Anche la chiusura dell’app smonta i volumi aperti nella sessione.
+5. Al termine premi **Espelli WSL** e attendi la conferma dello smontaggio prima di scollegare il cavo. Alla chiusura l’app tenta lo smontaggio e si chiude anche in caso di errore.
 
 ### Dischi da NAS ReadyNAS SPARC
 

@@ -1,9 +1,8 @@
-use crate::{win32::*, AUTO, COPY, HELP, MOVE, SHOW};
+use crate::{win32::*, AUTO, COPY, DESTINATION_SHOW, HELP, MOVE, SHOW};
 use std::ptr::null_mut;
 
 pub const MARGIN: i32 = 18;
-pub const PATHS_TOP: i32 = 123;
-pub const FILES_TOP: i32 = 249;
+pub const FILES_TOP: i32 = 123;
 pub const FOOTER_HEIGHT: i32 = 132;
 
 pub const INK: u32 = rgb(20, 52, 83);
@@ -26,6 +25,17 @@ pub fn rect(x: i32, y: i32, width: i32, height: i32) -> Rect {
     }
 }
 
+pub fn file_panels(width: i32, footer: i32) -> [Rect; 2] {
+    let gap = 12;
+    let available = width - 2 * MARGIN - gap;
+    let left = available / 2;
+    let height = footer - FILES_TOP - 10;
+    [
+        rect(MARGIN, FILES_TOP, left, height),
+        rect(MARGIN + left + gap, FILES_TOP, available - left, height),
+    ]
+}
+
 impl Rect {
     fn inset(self, amount: i32) -> Self {
         rect(
@@ -39,7 +49,7 @@ impl Rect {
 
 pub struct Theme {
     pub body: Handle,
-    bold: Handle,
+    pub bold: Handle,
     title: Handle,
     pub panel: Handle,
     pub icons: Handle,
@@ -107,34 +117,9 @@ impl Theme {
             0x24,
         );
 
-        panel(dc, rect(MARGIN, PATHS_TOP, width - 2 * MARGIN, 112));
-        label(
-            dc,
-            "Unità e percorsi",
-            rect(30, PATHS_TOP + 9, 220, 18),
-            self.bold,
-            INK,
-            0x24,
-        );
-        fill(dc, rect(30, PATHS_TOP + 33, width - 60, 1), LINE);
-
-        panel(
-            dc,
-            rect(
-                MARGIN,
-                FILES_TOP,
-                width - 2 * MARGIN,
-                footer - FILES_TOP - 10,
-            ),
-        );
-        label(
-            dc,
-            "File e cartelle",
-            rect(30, FILES_TOP + 7, 118, 30),
-            self.bold,
-            INK,
-            0x24,
-        );
+        for bounds in file_panels(width, footer) {
+            panel(dc, bounds);
+        }
 
         fill(dc, rect(0, footer, width, FOOTER_HEIGHT), PANEL);
         fill(dc, rect(0, footer, width, 1), LINE);
@@ -170,7 +155,9 @@ impl Theme {
             ),
             (COPY, _) => (rgb(31, 97, 168), rgb(20, 76, 143), WHITE, self.bold),
             (MOVE, _) => (rgb(255, 223, 141), rgb(238, 193, 95), INK, self.bold),
-            (AUTO | SHOW | HELP, _) => (rgb(181, 222, 249), rgb(148, 197, 233), INK, self.bold),
+            (AUTO | SHOW | DESTINATION_SHOW | HELP, _) => {
+                (rgb(181, 222, 249), rgb(148, 197, 233), INK, self.bold)
+            }
             _ => (rgb(228, 242, 250), rgb(201, 222, 239), INK, self.body),
         };
         let area = draw.rect;

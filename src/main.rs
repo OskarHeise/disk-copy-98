@@ -45,12 +45,65 @@ const DESTINATION_LABEL: i32 = 117;
 const EJECT: i32 = 118;
 const PROGRESS: i32 = 119;
 const KEEP_BOTH: i32 = 120;
+const DESTINATION_SHOW: i32 = 121;
+const DESTINATION_OPEN: i32 = 122;
+const DESTINATION_UP: i32 = 123;
+const DESTINATION_ADDRESS: i32 = 124;
+const DESTINATION_FILES: i32 = 125;
 const APP_ICON_RESOURCE: u16 = 101;
-const MIN_WIDTH: i32 = 700;
-const MIN_HEIGHT: i32 = 600;
+const MIN_WIDTH: i32 = 920;
+const MIN_HEIGHT: i32 = 560;
 const JOB_TIMER: usize = 1;
 const DEVICE_TIMER: usize = 2;
 const SELECTION_SIZE_TIMER: usize = 3;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane {
+    Source,
+    Destination,
+}
+
+struct PaneControls {
+    label: i32,
+    path: i32,
+    show: i32,
+    open: i32,
+    up: i32,
+    address: i32,
+    files: i32,
+}
+
+impl Pane {
+    fn controls(self) -> PaneControls {
+        match self {
+            Self::Source => PaneControls {
+                label: SOURCE_LABEL,
+                path: SOURCE,
+                show: SHOW,
+                open: OPEN,
+                up: UP,
+                address: ADDRESS,
+                files: FILES,
+            },
+            Self::Destination => PaneControls {
+                label: DESTINATION_LABEL,
+                path: DESTINATION,
+                show: DESTINATION_SHOW,
+                open: DESTINATION_OPEN,
+                up: DESTINATION_UP,
+                address: DESTINATION_ADDRESS,
+                files: DESTINATION_FILES,
+            },
+        }
+    }
+
+    fn with_listing<T>(self, read: impl FnOnce(&Listing) -> T) -> T {
+        match self {
+            Self::Source => UI.with_borrow(|ui| read(&ui.listing)),
+            Self::Destination => DESTINATION_VIEW.with_borrow(read),
+        }
+    }
+}
 
 #[derive(Default)]
 enum SelectionSize {
@@ -62,9 +115,7 @@ enum SelectionSize {
 
 #[derive(Default)]
 struct Browser {
-    root: PathBuf,
-    directory: PathBuf,
-    entries: Vec<Entry>,
+    listing: Listing,
     selected: BTreeSet<PathBuf>,
     selection_size: SelectionSize,
 }
@@ -75,7 +126,7 @@ impl Browser {
     }
 
     fn inside_selection(&self) -> bool {
-        self.directory != self.root && self.covered(&self.directory)
+        self.listing.can_go_up() && self.covered(&self.listing.directory)
     }
 
     fn check(&mut self, path: PathBuf) {
@@ -84,7 +135,7 @@ impl Browser {
     }
 
     fn selection_summary(&self) -> String {
-        let visible = self.entries.len();
+        let visible = self.listing.entries.len();
         let count = self.selected.len();
         if count == 0 {
             return format!("{visible} visibili  /  0 con spunta");
@@ -107,6 +158,7 @@ impl Browser {
     }
 }
 
+#[derive(Default)]
 struct Listing {
     root: PathBuf,
     directory: PathBuf,
@@ -114,36 +166,53 @@ struct Listing {
 }
 
 impl Listing {
-    fn read(root: PathBuf, directory: PathBuf) -> io::Result<Self> {
-        let entries = copy::list(&root, &directory)?;
+    fn read(pane: Pane, root: PathBuf, directory: PathBuf) -> io::Result<Self> {
+        let entries = copy::list(&root, &directory, pane == Pane::Source)?;
         Ok(Self {
             root,
             directory,
             entries,
         })
     }
+
+    fn can_go_up(&self) -> bool {
+        self.directory != self.root
+    }
+
+    fn selected_folder(&self, index: Option<usize>) -> Option<&Path> {
+        let entry = self.entries.get(index?)?;
+        entry.directory.then_some(entry.path.as_path())
+    }
+
+    fn current_folder<'a>(&'a self, input: &'a Path) -> &'a Path {
+        if self.root == input {
+            &self.directory
+        } else {
+            input
+        }
+    }
 }
 
 enum TaskResult {
-    Browse(io::Result<Listing>),
+    Browse(Pane, io::Result<Listing>),
     Drives {
         result: io::Result<disks::Inventory>,
         choose: bool,
     },
     Mount {
         result: io::Result<linux::MountedDisk>,
-        field: i32,
+        pane: Pane,
     },
     Eject {
         remaining: Vec<linux::MountedDisk>,
         error: Option<String>,
-        exit: bool,
     },
     Transfer {
         message: String,
         details: Option<String>,
         finished: bool,
-        refreshed: Option<Browser>,
+        source: Option<Browser>,
+        destination: Option<Listing>,
     },
 }
 
@@ -152,8 +221,10 @@ type SizeTask = (Arc<AtomicBool>, JoinHandle<copy::SizeEstimate>);
 
 thread_local! {
     static UI: RefCell<Browser> = RefCell::new(Browser::default());
+    static DESTINATION_VIEW: RefCell<Listing> = RefCell::new(Listing::default());
     static THEME: RefCell<Option<Theme>> = const { RefCell::new(None) };
     static JOB: RefCell<Option<Receiver<TaskResult>>> = const { RefCell::new(None) };
+    static EJECT_EXIT: Cell<Option<bool>> = const { Cell::new(None) };
     static SIZE_TASK: RefCell<Option<SizeTask>> = const { RefCell::new(None) };
     static ACTIVE_PROGRESS: RefCell<Option<(Operation, TransferProgress)>> = const { RefCell::new(None) };
     static REDRAW_LIST: Cell<bool> = const { Cell::new(false) };
@@ -214,54 +285,63 @@ unsafe fn setup(window: Handle) {
     const DROPDOWN: u32 = TAB | 0x200_000 | 0x42;
     const BUTTON: u32 = TAB | 0xb;
     control(window, "BUTTON", "&Help · F1", HELP, BUTTON, 0);
-    control(window, "STATIC", "&Origine", SOURCE_LABEL, 0x200, 0);
-    let source = control(window, "COMBOBOX", "", SOURCE, DROPDOWN, 0);
-    control(window, "BUTTON", "&Auto disco", AUTO, BUTTON, 0);
-    control(
-        window,
-        "STATIC",
-        "&Destinazione",
-        DESTINATION_LABEL,
-        0x200,
-        0,
-    );
-    control(window, "COMBOBOX", "", DESTINATION, DROPDOWN, 0);
-    control(window, "BUTTON", "&Mostra file", SHOW, BUTTON, 0);
-    control(window, "BUTTON", "Espelli WSL", EJECT, BUTTON, 0);
-    control(window, "BUTTON", "Apri", OPEN, BUTTON, 0);
-    control(window, "BUTTON", "Su", UP, BUTTON, 0);
-    control(window, "BUTTON", "Spunta tutti", SELECT_ALL, BUTTON, 0);
-    control(window, "BUTTON", "Azzera spunte", CLEAR, BUTTON, 0);
-    control(window, "STATIC", "", ADDRESS, 0x40c0, 0x200);
-    let list = control(
-        window,
-        "SysListView32",
-        "",
-        FILES,
-        TAB | 0x0040 | 0x0008 | 0x0004 | 1,
-        0x200,
-    );
-    SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x0001_0024);
-    let icons = THEME.with_borrow(|theme| theme.as_ref().unwrap().icons);
-    if !icons.is_null() {
-        SendMessageW(list, LVM_SETIMAGELIST, 1, icons as isize);
-    }
-    for (index, (label, width)) in [("Nome", 340), ("Tipo", 96), ("Dimensione", 121)]
-        .into_iter()
-        .enumerate()
-    {
-        let label = wide(label);
-        let column = ListColumn {
-            mask: 7,
-            format: i32::from(index == 2),
-            width,
-            text: label.as_ptr(),
-            capacity: 0,
-            subitem: 0,
-            image: 0,
-            order: 0,
-        };
-        SendMessageW(list, LVM_INSERTCOLUMNW, index, &column as *const _ as isize);
+    for (pane, heading, tool, tool_label, browse_label) in [
+        (Pane::Source, "&Origine", AUTO, "&Auto disco", "&Sfoglia"),
+        (
+            Pane::Destination,
+            "&Destinazione",
+            EJECT,
+            "Espelli WSL",
+            "S&foglia",
+        ),
+    ] {
+        let ids = pane.controls();
+        let label = control(window, "STATIC", heading, ids.label, 0x200, 0);
+        let (bold, icons) = THEME.with_borrow(|theme| {
+            let theme = theme.as_ref().unwrap();
+            (theme.bold, theme.icons)
+        });
+        SendMessageW(label, WM_SETFONT, bold as usize, 1);
+        control(window, "COMBOBOX", "", ids.path, DROPDOWN, 0);
+        control(window, "BUTTON", tool_label, tool, BUTTON, 0);
+        control(window, "BUTTON", browse_label, ids.show, BUTTON, 0);
+        control(window, "BUTTON", "Apri", ids.open, BUTTON, 0);
+        control(window, "BUTTON", "Su", ids.up, BUTTON, 0);
+        if pane == Pane::Source {
+            control(window, "BUTTON", "Spunta tutti", SELECT_ALL, BUTTON, 0);
+            control(window, "BUTTON", "Azzera spunte", CLEAR, BUTTON, 0);
+        }
+        control(window, "STATIC", "", ids.address, 0x80c0, 0x200);
+        let list = control(
+            window,
+            "SysListView32",
+            "",
+            ids.files,
+            TAB | 0x0040 | 0x0008 | 0x0004 | 1,
+            0x200,
+        );
+        let checks = if pane == Pane::Source { 4 } else { 0 };
+        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x0001_0020 | checks);
+        if !icons.is_null() {
+            SendMessageW(list, LVM_SETIMAGELIST, 1, icons as isize);
+        }
+        for (index, (label, width)) in [("Nome", 210), ("Tipo", 75), ("Dimensione", 104)]
+            .into_iter()
+            .enumerate()
+        {
+            let label = wide(label);
+            let column = ListColumn {
+                mask: 7,
+                format: i32::from(index == 2),
+                width,
+                text: label.as_ptr(),
+                capacity: 0,
+                subitem: 0,
+                image: 0,
+                order: 0,
+            };
+            SendMessageW(list, LVM_INSERTCOLUMNW, index, &column as *const _ as isize);
+        }
     }
     control(window, "STATIC", "", SELECTION, 0x80, 0);
     control(window, "BUTTON", "&Copia tutto", COPY, BUTTON, 0);
@@ -290,8 +370,9 @@ unsafe fn setup(window: Handle) {
         0x80,
         0,
     );
-    update_view(window);
-    SetFocus(source);
+    update_view(window, Pane::Source);
+    update_view(window, Pane::Destination);
+    SetFocus(GetDlgItem(window, SOURCE));
     scan_drives(window, true);
 }
 
@@ -300,37 +381,51 @@ unsafe fn layout(window: Handle) {
     GetClientRect(window, &mut area);
     let width = area.right;
     let footer = area.bottom - FOOTER_HEIGHT;
-    if width < 500 || footer < FILES_TOP + 126 {
+    if width < 870 || footer < FILES_TOP + 200 {
         return;
     }
     let place = |id, x, y, w, h| MoveWindow(GetDlgItem(window, id), x, y, w, h, 1);
     place(HELP, width - 119, 36, 98, 34);
-    place(SOURCE_LABEL, 30, 167, 90, 25);
-    place(SOURCE, 123, 168, width - 281, 190);
-    place(AUTO, width - 147, 165, 118, 29);
-    place(DESTINATION_LABEL, 30, 201, 90, 25);
-    place(DESTINATION, 123, 201, width - 152, 190);
-    place(EJECT, 30, FILES_TOP + 8, 113, 29);
-    place(SHOW, 151, FILES_TOP + 8, 109, 29);
-    place(OPEN, 268, FILES_TOP + 8, 66, 29);
-    place(UP, 342, FILES_TOP + 8, 51, 29);
-    place(SELECT_ALL, 401, FILES_TOP + 8, 101, 29);
-    place(CLEAR, 510, FILES_TOP + 8, 112, 29);
-    place(ADDRESS, 30, FILES_TOP + 46, width - 60, 23);
-    place(
-        FILES,
-        30,
-        FILES_TOP + 77,
-        width - 60,
-        footer - FILES_TOP - 115,
-    );
-    SendMessageW(
-        GetDlgItem(window, FILES),
-        LVM_SETCOLUMNWIDTH,
-        0,
-        (width - 302) as isize,
-    );
-    place(SELECTION, 30, footer - 31, width - 60, 18);
+    let [left, right] = theme::file_panels(width, footer);
+    for (pane, bounds, tool) in [
+        (Pane::Source, left, AUTO),
+        (Pane::Destination, right, EJECT),
+    ] {
+        let ids = pane.controls();
+        let x = bounds.left + 12;
+        let end = bounds.right - 12;
+        let inner = end - x;
+        place(ids.label, x, FILES_TOP + 9, inner - 112, 25);
+        place(tool, end - 106, FILES_TOP + 8, 106, 26);
+        place(ids.path, x, FILES_TOP + 40, inner, 200);
+        place(ids.show, x, FILES_TOP + 71, 78, 27);
+        place(ids.open, x + 85, FILES_TOP + 71, 48, 27);
+        place(ids.up, x + 140, FILES_TOP + 71, 40, 27);
+        place(ids.address, x, FILES_TOP + 106, inner, 23);
+        let list_bottom = if pane == Pane::Source {
+            footer - 59
+        } else {
+            footer - 22
+        };
+        place(
+            ids.files,
+            x,
+            FILES_TOP + 137,
+            inner,
+            list_bottom - FILES_TOP - 137,
+        );
+        SendMessageW(
+            GetDlgItem(window, ids.files),
+            LVM_SETCOLUMNWIDTH,
+            0,
+            (inner - 201) as isize,
+        );
+        if pane == Pane::Source {
+            place(SELECT_ALL, x + 187, FILES_TOP + 71, 90, 27);
+            place(CLEAR, x + 284, FILES_TOP + 71, 102, 27);
+            place(SELECTION, x, footer - 52, inner, 34);
+        }
+    }
     place(MOVE, width - 174, footer + 11, 156, 33);
     place(COPY, width - 334, footer + 11, 151, 33);
     place(KEEP_BOTH, MARGIN + 2, footer + 11, width - 365, 33);
@@ -365,12 +460,6 @@ fn physical_disk(path: &Path) -> Option<disks::Disk> {
     })
 }
 
-unsafe fn selected_disk_item(combo: Handle) -> Option<usize> {
-    let selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
-    let data = SendMessageW(combo, CB_GETITEMDATA, usize::try_from(selection).ok()?, 0);
-    usize::try_from(data).ok().filter(|&index| index > 0)
-}
-
 unsafe fn add_disk_item(combo: Handle, label: &str, data: usize) {
     let item = SendMessageW(combo, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
     if item >= 0 {
@@ -403,13 +492,25 @@ unsafe fn add_volumes(window: Handle, first: usize) {
     });
 }
 
-unsafe fn set_path(window: Handle, id: i32, path: &Path) {
+unsafe fn set_path(window: Handle, pane: Pane, path: &Path) {
+    write_path(window, pane, path);
+    clear_pane(window, pane);
+}
+
+unsafe fn write_path(window: Handle, pane: Pane, path: &Path) {
     SETTING_PATHS.set(true);
     let value: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
-    SetWindowTextW(GetDlgItem(window, id), value.as_ptr());
+    SetWindowTextW(GetDlgItem(window, pane.controls().path), value.as_ptr());
     SETTING_PATHS.set(false);
-    if id == SOURCE {
-        replace_browser(window, Browser::default());
+}
+
+unsafe fn clear_pane(window: Handle, pane: Pane) {
+    match pane {
+        Pane::Source => replace_browser(window, Browser::default()),
+        Pane::Destination => {
+            DESTINATION_VIEW.with(|view| view.replace(Listing::default()));
+            update_view(window, pane);
+        }
     }
 }
 
@@ -508,7 +609,7 @@ unsafe fn refresh_drives(window: Handle, choose: bool, result: io::Result<disks:
     add_volumes(window, 0);
     SETTING_PATHS.set(false);
     if source != new_source {
-        replace_browser(window, Browser::default());
+        clear_pane(window, Pane::Source);
     }
     if failed && (choose || removed) {
         status(window, "Inventario dei dischi fisici non disponibile. Puoi usare le unità con lettera o digitare un percorso.");
@@ -517,13 +618,7 @@ unsafe fn refresh_drives(window: Handle, choose: bool, result: io::Result<disks:
             status(window, &disk.notice);
         }
     } else if automatic {
-        status(
-            window,
-            &format!(
-                "Unità {} selezionata. Scegli la destinazione o premi Mostra file.",
-                new_source.display()
-            ),
-        );
+        show_files(window, Pane::Source);
     } else if removed {
         status(
             window,
@@ -571,30 +666,29 @@ unsafe fn launch(
     }
 }
 
-unsafe fn show_files(window: Handle) {
-    let root = field(window, SOURCE);
+unsafe fn show_files(window: Handle, pane: Pane) {
+    let root = field(window, pane.controls().path);
     if let Some(disk) = physical_disk(&root) {
-        mount_disk(window, SOURCE, disk);
+        mount_disk(window, pane, disk);
         return;
     }
     if !root.is_absolute() {
         status(
             window,
-            "Scegli un'unità o inserisci un percorso di origine assoluto.",
+            match pane {
+                Pane::Source => "Scegli un'unità di origine o inserisci un percorso assoluto.",
+                Pane::Destination => {
+                    "Scegli un'unità di destinazione o inserisci un percorso assoluto."
+                }
+            },
         );
         return;
     }
-    let directory = UI.with_borrow(|ui| {
-        if ui.root == root {
-            ui.directory.clone()
-        } else {
-            root.clone()
-        }
-    });
-    browse(window, root, directory);
+    let directory = pane.with_listing(|view| view.current_folder(&root).to_path_buf());
+    browse(window, pane, root, directory);
 }
 
-unsafe fn mount_disk(window: Handle, field: i32, disk: disks::Disk) {
+unsafe fn mount_disk(window: Handle, pane: Pane, disk: disks::Disk) {
     if !disk.mountable {
         status(window, &disk.notice);
         return;
@@ -604,19 +698,34 @@ unsafe fn mount_disk(window: Handle, field: i32, disk: disks::Disk) {
         Some("Collegamento del disco a WSL. Conferma eventuali richieste di Windows…"),
         move || TaskResult::Mount {
             result: linux::MountedDisk::open(disk),
-            field,
+            pane,
         },
     );
 }
 
-unsafe fn choose_disk_item(window: Handle, id: i32, combo: Handle) {
-    let Some(item) = selected_disk_item(combo) else {
+unsafe fn choose_disk_item(window: Handle, pane: Pane, combo: Handle) {
+    let Ok(index) = usize::try_from(SendMessageW(combo, CB_GETCURSEL, 0, 0)) else {
         return;
     };
+    let Ok(item) = usize::try_from(SendMessageW(combo, CB_GETITEMDATA, index, 0)) else {
+        return;
+    };
+    if item == 0 {
+        let length = SendMessageW(combo, CB_GETLBTEXTLEN, index, 0);
+        if length > 0 {
+            let mut value = vec![0u16; length as usize + 1];
+            let length = SendMessageW(combo, CB_GETLBTEXT, index, value.as_mut_ptr() as isize);
+            if length > 0 {
+                let path = PathBuf::from(OsString::from_wide(&value[..length as usize]));
+                open_volume(window, pane, path);
+            }
+        }
+        return;
+    }
     let physical = DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(Vec::len);
     if item <= physical {
         let disk = DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(|disks| disks[item - 1].clone());
-        mount_disk(window, id, disk);
+        mount_disk(window, pane, disk);
     } else {
         let path = MOUNTED_DISKS.with_borrow(|disks| {
             disks
@@ -626,14 +735,14 @@ unsafe fn choose_disk_item(window: Handle, id: i32, combo: Handle) {
                 .map(|volume| volume.path.clone())
         });
         if let Some(path) = path {
-            set_path(window, id, &path);
-            if id == SOURCE {
-                browse(window, path.clone(), path);
-            } else {
-                status(window, "Volume Linux impostato come destinazione.");
-            }
+            open_volume(window, pane, path);
         }
     }
+}
+
+unsafe fn open_volume(window: Handle, pane: Pane, path: PathBuf) {
+    set_path(window, pane, &path);
+    browse(window, pane, path.clone(), path);
 }
 
 unsafe fn eject_linux(window: Handle, exit: bool) {
@@ -642,7 +751,7 @@ unsafe fn eject_linux(window: Handle, exit: bool) {
         disks
             .iter()
             .flat_map(|disk| &disk.volumes)
-            .any(|volume| ui.root.starts_with(&volume.path))
+            .any(|volume| ui.listing.root.starts_with(&volume.path))
     }) {
         queue_selection_size(window);
     }
@@ -658,43 +767,48 @@ unsafe fn eject_linux(window: Handle, exit: bool) {
                     remaining.push(disk);
                 }
             }
-            TaskResult::Eject {
-                remaining,
-                error,
-                exit,
-            }
+            TaskResult::Eject { remaining, error }
         },
     );
+    if busy() {
+        EJECT_EXIT.set(Some(exit));
+    } else if exit {
+        DestroyWindow(window);
+    }
 }
 
-unsafe fn browse(window: Handle, root: PathBuf, directory: PathBuf) {
-    launch(window, Some("Lettura dei file in corso…"), move || {
-        TaskResult::Browse(Listing::read(root, directory))
+unsafe fn browse(window: Handle, pane: Pane, root: PathBuf, directory: PathBuf) {
+    let progress = match pane {
+        Pane::Source => "Lettura dell'origine…",
+        Pane::Destination => "Lettura della destinazione…",
+    };
+    launch(window, Some(progress), move || {
+        TaskResult::Browse(pane, Listing::read(pane, root, directory))
     });
 }
 
-unsafe fn highlighted(window: Handle) -> Option<usize> {
-    let index = SendMessageW(GetDlgItem(window, FILES), LVM_GETNEXTITEM, usize::MAX, 2);
+unsafe fn highlighted(window: Handle, pane: Pane) -> Option<usize> {
+    let index = SendMessageW(
+        GetDlgItem(window, pane.controls().files),
+        LVM_GETNEXTITEM,
+        usize::MAX,
+        2,
+    );
     usize::try_from(index).ok()
 }
 
-unsafe fn navigate(window: Handle, up: bool) {
-    let index = highlighted(window);
-    let target = UI.with_borrow(|ui| {
-        let directory = if up && ui.directory != ui.root {
-            ui.directory.parent().map(Path::to_path_buf)
-        } else if !up {
-            index
-                .and_then(|index| ui.entries.get(index))
-                .filter(|entry| entry.directory)
-                .map(|entry| entry.path.clone())
+unsafe fn navigate(window: Handle, pane: Pane, up: bool) {
+    let index = highlighted(window, pane);
+    let target = pane.with_listing(|view| {
+        let directory = if up {
+            view.can_go_up().then(|| view.directory.parent()).flatten()
         } else {
-            None
+            view.selected_folder(index)
         }?;
-        Some((ui.root.clone(), directory))
+        Some((view.root.clone(), directory.to_path_buf()))
     });
     if let Some((root, directory)) = target {
-        browse(window, root, directory);
+        browse(window, pane, root, directory);
     }
 }
 
@@ -704,14 +818,16 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
     }
     let source = field(window, SOURCE);
     if let Some(disk) = physical_disk(&source) {
-        mount_disk(window, SOURCE, disk);
+        mount_disk(window, Pane::Source, disk);
         return;
     }
-    let destination = field(window, DESTINATION);
-    if let Some(disk) = physical_disk(&destination) {
-        mount_disk(window, DESTINATION, disk);
+    let destination_root = field(window, DESTINATION);
+    if let Some(disk) = physical_disk(&destination_root) {
+        mount_disk(window, Pane::Destination, disk);
         return;
     }
+    let destination =
+        DESTINATION_VIEW.with_borrow(|view| view.current_folder(&destination_root).to_path_buf());
     let moving = operation == Operation::Move;
     let move_access = moving.then(|| linux_move_access(&source)).flatten();
     if readonly_volume(&destination)
@@ -731,9 +847,9 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
         return;
     }
     let (directory, selected) = UI.with_borrow(|ui| {
-        if ui.root == source {
+        if ui.listing.root == source {
             (
-                ui.directory.clone(),
+                ui.listing.directory.clone(),
                 ui.selected.iter().cloned().collect::<Vec<_>>(),
             )
         } else {
@@ -821,12 +937,14 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
                     (message.clone(), Some(message))
                 }
             };
-            let refreshed = moving.then(|| refresh_after_move(source, directory, selected));
+            let source = moving.then(|| refresh_after_move(source, directory, selected));
+            let destination = Listing::read(Pane::Destination, destination_root, destination).ok();
             TaskResult::Transfer {
                 message,
                 details,
                 finished,
-                refreshed,
+                source,
+                destination,
             }
         },
     );
@@ -899,7 +1017,7 @@ unsafe fn poll_selection_size(window: Handle) {
         (!ui.selected.is_empty() && matches!(ui.selection_size, SelectionSize::Pending)).then(
             || {
                 (
-                    ui.root.clone(),
+                    ui.listing.root.clone(),
                     ui.selected.iter().cloned().collect::<Vec<_>>(),
                 )
             },
@@ -953,11 +1071,13 @@ fn refresh_after_move(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>)
         .ancestors()
         .take_while(|path| path.starts_with(&root))
     {
-        if let Ok(entries) = copy::list(&root, directory) {
+        if let Ok(entries) = copy::list(&root, directory, true) {
             return Browser {
-                directory: directory.into(),
-                root,
-                entries,
+                listing: Listing {
+                    directory: directory.into(),
+                    root,
+                    entries,
+                },
                 selected,
                 selection_size: SelectionSize::Pending,
             };
@@ -996,18 +1116,22 @@ unsafe fn collect_task(window: Handle) {
     JOB.with(|job| job.replace(None));
     ACTIVE_PROGRESS.with(|active| active.replace(None));
     KillTimer(window, JOB_TIMER);
+    if EJECT_EXIT.take() == Some(true) {
+        DestroyWindow(window);
+        return;
+    }
     match result {
         Some(Ok(TaskResult::Drives { result, choose })) => {
             refresh_drives(window, choose, result);
         }
         Some(Ok(TaskResult::Mount {
             result: Ok(disk),
-            field,
+            pane,
         })) => {
             let mut choices = disk
                 .volumes
                 .iter()
-                .filter(|volume| field == SOURCE || !volume.readonly);
+                .filter(|volume| pane == Pane::Source || !volume.readonly);
             let path = choices.next().map(|volume| volume.path.clone());
             let multiple = choices.next().is_some();
             let first = MOUNTED_DISKS
@@ -1015,20 +1139,12 @@ unsafe fn collect_task(window: Handle) {
             MOUNTED_DISKS.with_borrow_mut(|disks| disks.push(disk));
             add_volumes(window, first);
             if multiple {
-                set_path(window, field, Path::new(""));
+                set_path(window, pane, Path::new(""));
                 status(window, "Disco aperto in WSL. Scegli il volume dal menu.");
             } else if let Some(path) = path {
-                set_path(window, field, &path);
-                if field == SOURCE {
-                    browse(window, path.clone(), path);
-                } else {
-                    status(
-                        window,
-                        "Volume Linux impostato. Premi Copia o Sposta per trasferire i file.",
-                    );
-                }
+                open_volume(window, pane, path);
             } else {
-                set_path(window, field, Path::new(""));
+                set_path(window, pane, Path::new(""));
                 status(
                     window,
                     "I volumi del disco sono in sola lettura. Puoi sceglierli dal menu Origine.",
@@ -1047,18 +1163,14 @@ unsafe fn collect_task(window: Handle) {
                 0x30,
             );
         }
-        Some(Ok(TaskResult::Eject {
-            remaining,
-            error,
-            exit,
-        })) => {
+        Some(Ok(TaskResult::Eject { remaining, error })) => {
             MOUNTED_DISKS.with(|disks| disks.replace(remaining));
-            for id in [SOURCE, DESTINATION] {
-                if field(window, id)
+            for pane in [Pane::Source, Pane::Destination] {
+                if field(window, pane.controls().path)
                     .to_string_lossy()
                     .contains(r"\mnt\wsl\disk-copy-98.")
                 {
-                    set_path(window, id, Path::new(""));
+                    set_path(window, pane, Path::new(""));
                 }
             }
             if let Some(error) = error {
@@ -1069,62 +1181,79 @@ unsafe fn collect_task(window: Handle) {
                     wide("Smontaggio · Disk Copy 98").as_ptr(),
                     0x30,
                 );
-                scan_drives(window, false);
-            } else if exit {
-                DestroyWindow(window);
-                return;
             } else {
                 status(window, "Dischi Linux smontati.");
-                scan_drives(window, false);
             }
+            scan_drives(window, false);
         }
-        Some(Ok(TaskResult::Browse(Ok(listing)))) => {
-            let count = listing.entries.len();
-            let readonly = readonly_volume(&listing.root);
-            let can_move = linux_move_access(&listing.root).is_some();
-            let remeasure = UI.with_borrow_mut(|ui| {
-                let count = ui.selected.len();
-                let same_directory = ui.directory == listing.directory;
-                if ui.root != listing.root {
-                    ui.selected.clear();
+        Some(Ok(TaskResult::Browse(pane, Ok(listing)))) => {
+            if field(window, pane.controls().path) != listing.root {
+                write_path(window, pane, &listing.root);
+            }
+            let message = match pane {
+                Pane::Source => {
+                    let message = if listing.entries.is_empty() {
+                        "La cartella di origine è vuota."
+                    } else if readonly_volume(&listing.root)
+                        && linux_move_access(&listing.root).is_none()
+                    {
+                        "Origine Linux in sola lettura. Spunta gli elementi da copiare."
+                    } else {
+                        "Spunta a sinistra i file e le cartelle da trasferire."
+                    };
+                    let remeasure = UI.with_borrow_mut(|ui| {
+                        let count = ui.selected.len();
+                        let same_directory = ui.listing.directory == listing.directory;
+                        if ui.listing.root != listing.root {
+                            ui.selected.clear();
+                        }
+                        let visible: BTreeSet<_> =
+                            listing.entries.iter().map(|entry| &entry.path).collect();
+                        ui.selected.retain(|path| {
+                            path.parent() != Some(&listing.directory) || visible.contains(&path)
+                        });
+                        ui.listing = listing;
+                        same_directory || count != ui.selected.len()
+                    });
+                    if remeasure {
+                        queue_selection_size(window);
+                    }
+                    message
                 }
-                ui.root = listing.root;
-                ui.directory = listing.directory;
-                ui.entries = listing.entries;
-                let current = &ui.directory;
-                let visible: BTreeSet<_> = ui.entries.iter().map(|entry| &entry.path).collect();
-                ui.selected
-                    .retain(|path| path.parent() != Some(current) || visible.contains(&path));
-                same_directory || count != ui.selected.len()
-            });
-            if remeasure {
-                queue_selection_size(window);
-            }
-            update_view(window);
-            status(
-                window,
-                if count == 0 {
-                    "La cartella è vuota."
-                } else if can_move {
-                    "Spunta i file e scegli Copia selezione o Sposta selezione."
-                } else if readonly {
-                    "Volume Linux in sola lettura. Spunta i file o le cartelle da copiare."
-                } else {
-                    "Spunta i file o le cartelle da trasferire. Apri le cartelle con un doppio clic."
-                },
-            );
+                Pane::Destination => {
+                    let readonly = readonly_volume(&listing.directory);
+                    DESTINATION_VIEW.with(|view| view.replace(listing));
+                    if readonly {
+                        "La cartella di destinazione è in sola lettura."
+                    } else {
+                        "I file verranno trasferiti nella cartella aperta a destra."
+                    }
+                }
+            };
+            update_view(window, pane);
+            status(window, message);
         }
-        Some(Ok(TaskResult::Browse(Err(error)))) => {
-            status(window, &format!("Impossibile aprire il percorso. {error}"))
+        Some(Ok(TaskResult::Browse(pane, Err(error)))) => {
+            let location = if pane == Pane::Source {
+                "l'origine"
+            } else {
+                "la destinazione"
+            };
+            status(window, &format!("Impossibile aprire {location}. {error}"))
         }
         Some(Ok(TaskResult::Transfer {
             message,
             details,
             finished,
-            refreshed,
+            source,
+            destination,
         })) => {
-            if let Some(browser) = refreshed {
+            if let Some(browser) = source {
                 replace_browser(window, browser);
+            }
+            if let Some(listing) = destination {
+                DESTINATION_VIEW.with(|view| view.replace(listing));
+                update_view(window, Pane::Destination);
             }
             status(window, &message);
             if finished {
@@ -1147,17 +1276,18 @@ unsafe fn collect_task(window: Handle) {
 unsafe fn replace_browser(window: Handle, browser: Browser) {
     UI.with(|ui| ui.replace(browser));
     queue_selection_size(window);
-    update_view(window);
+    update_view(window, Pane::Source);
 }
 
-unsafe fn update_view(window: Handle) {
-    let list = GetDlgItem(window, FILES);
+unsafe fn update_view(window: Handle, pane: Pane) {
+    let ids = pane.controls();
+    let list = GetDlgItem(window, ids.files);
     let icons = THEME.with_borrow(|theme| !theme.as_ref().unwrap().icons.is_null());
     REDRAW_LIST.set(true);
     SendMessageW(list, 0x000b, 0, 0); // WM_SETREDRAW
     SendMessageW(list, LVM_DELETEALLITEMS, 0, 0);
-    UI.with_borrow(|ui| {
-        for (index, entry) in ui.entries.iter().enumerate() {
+    pane.with_listing(|view| {
+        for (index, entry) in view.entries.iter().enumerate() {
             let name: Vec<_> = entry
                 .path
                 .file_name()
@@ -1165,13 +1295,12 @@ unsafe fn update_view(window: Handle) {
                 .encode_wide()
                 .chain([0])
                 .collect();
-            let check = if ui.covered(&entry.path) { 2 } else { 1 };
             let mut item = ListItem {
-                mask: if icons { 0xb } else { 9 },
+                mask: if icons { 3 } else { 1 },
                 item: index as i32,
                 subitem: 0,
-                state: check << 12,
-                state_mask: LVIS_STATEIMAGEMASK,
+                state: 0,
+                state_mask: 0,
                 text: name.as_ptr(),
                 capacity: 0,
                 image: i32::from(!entry.directory),
@@ -1194,18 +1323,23 @@ unsafe fn update_view(window: Handle) {
             }
         }
     });
-    update_checks(window);
+    if pane == Pane::Source {
+        update_checks(window);
+    }
     SendMessageW(list, 0x000b, 1, 0);
     REDRAW_LIST.set(false);
     InvalidateRect(list, null(), 1);
-    let address = UI.with_borrow(|ui| {
-        if ui.directory.as_os_str().is_empty() {
-            String::from("Premi Mostra file per esplorare l'origine.")
+    let address = pane.with_listing(|view| {
+        if view.directory.as_os_str().is_empty() {
+            match pane {
+                Pane::Source => "Scegli l'unità o il percorso da sfogliare.".into(),
+                Pane::Destination => "Apri la cartella in cui trasferire i file.".into(),
+            }
         } else {
-            ui.directory.display().to_string()
+            view.directory.display().to_string()
         }
     });
-    text(window, ADDRESS, &address);
+    text(window, ids.address, &address);
     update_controls(window);
 }
 
@@ -1213,7 +1347,7 @@ unsafe fn update_checks(window: Handle) {
     let restoring = REDRAW_LIST.replace(true);
     let list = GetDlgItem(window, FILES);
     UI.with_borrow(|ui| {
-        for (index, entry) in ui.entries.iter().enumerate() {
+        for (index, entry) in ui.listing.entries.iter().enumerate() {
             let item = ListItem {
                 mask: 8,
                 item: index as i32,
@@ -1235,28 +1369,32 @@ unsafe fn update_checks(window: Handle) {
 unsafe fn update_controls(window: Handle) {
     let busy = busy();
     let source = field(window, SOURCE);
-    let highlighted = highlighted(window);
-    let (count, visible, can_open, can_up, covered, summary) = UI.with_borrow(|ui| {
+    for pane in [Pane::Source, Pane::Destination] {
+        let ids = pane.controls();
+        let selected = highlighted(window, pane);
+        let (can_open, can_up) =
+            pane.with_listing(|view| (view.selected_folder(selected).is_some(), view.can_go_up()));
+        for (id, enabled) in [
+            (ids.path, true),
+            (ids.show, true),
+            (ids.files, true),
+            (ids.open, can_open),
+            (ids.up, can_up),
+        ] {
+            EnableWindow(GetDlgItem(window, id), i32::from(enabled && !busy));
+        }
+    }
+    let (count, visible, covered, summary) = UI.with_borrow(|ui| {
         (
             ui.selected.len(),
-            ui.entries.len(),
-            highlighted
-                .and_then(|i| ui.entries.get(i))
-                .is_some_and(|entry| entry.directory),
-            ui.directory != ui.root,
+            ui.listing.entries.len(),
             ui.inside_selection(),
             ui.selection_summary(),
         )
     });
     for (id, enabled) in [
-        (SOURCE, true),
-        (DESTINATION, true),
         (AUTO, true),
-        (SHOW, true),
         (EJECT, MOUNTED_DISKS.with_borrow(|disks| !disks.is_empty())),
-        (FILES, true),
-        (OPEN, can_open),
-        (UP, can_up),
         (SELECT_ALL, visible > 0 && !covered),
         (CLEAR, count > 0),
         (COPY, true),
@@ -1285,9 +1423,13 @@ unsafe fn bulk_selection(window: Handle, select: bool) {
         if !select {
             ui.selected.clear();
         } else if !ui.inside_selection() {
-            let mut visible: BTreeSet<_> =
-                ui.entries.iter().map(|entry| entry.path.clone()).collect();
-            let directory = &ui.directory;
+            let mut visible: BTreeSet<_> = ui
+                .listing
+                .entries
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect();
+            let directory = &ui.listing.directory;
             ui.selected.retain(|item| {
                 let Ok(relative) = item.strip_prefix(directory) else {
                     return true;
@@ -1305,13 +1447,13 @@ unsafe fn bulk_selection(window: Handle, select: bool) {
     update_controls(window);
 }
 
-unsafe fn list_notification(window: Handle, notification: &Notification) -> isize {
+unsafe fn list_notification(window: Handle, pane: Pane, notification: &Notification) -> isize {
     if REDRAW_LIST.get() || busy() {
         return 0;
     }
     match notification.code {
-        -3 => navigate(window, false), // NM_DBLCLK
-        -100 | -101 => {
+        -3 | -4 => navigate(window, pane, false), // NM_DBLCLK | NM_RETURN
+        -100 | -101 if pane == Pane::Source => {
             let change = &*(notification as *const Notification as *const ListNotification);
             let old = change.old_state & LVIS_STATEIMAGEMASK;
             let new = change.new_state & LVIS_STATEIMAGEMASK;
@@ -1320,7 +1462,7 @@ unsafe fn list_notification(window: Handle, notification: &Notification) -> isiz
                     return UI.with_borrow(Browser::inside_selection) as isize;
                 }
                 let changed = UI.with_borrow_mut(|ui| {
-                    let Some(entry) = ui.entries.get(change.item as usize) else {
+                    let Some(entry) = ui.listing.entries.get(change.item as usize) else {
                         return false;
                     };
                     let path = entry.path.clone();
@@ -1339,6 +1481,7 @@ unsafe fn list_notification(window: Handle, notification: &Notification) -> isiz
                 update_controls(window);
             }
         }
+        -101 => update_controls(window),
         _ => {}
     }
     0
@@ -1348,11 +1491,13 @@ unsafe fn help(window: Handle) {
     MessageBoxW(
         window,
         wide(concat!(
-            "1. Scegli origine e destinazione dai menu oppure digita i percorsi. ",
+            "1. Scegli l'unità di origine a sinistra e quella di destinazione a destra. ",
+            "Per aprire un percorso digitato o incollato, usa Sfoglia nel relativo pannello. ",
             "Auto disco dà priorità alle unità USB e rimovibili. ",
             "Scegli un disco senza lettera per montarlo tramite WSL. ",
-            "Se lo ha trovato Auto disco, premi Mostra file. Usa Espelli WSL prima di scollegarlo.\r\n\r\n",
-            "2. Premi Mostra file. Apri una cartella con un doppio clic o con Apri. Usa Su per risalire. ",
+            "Se lo ha trovato Auto disco, premi Sfoglia. Usa Espelli WSL e controlla l'esito prima di scollegare il disco.\r\n\r\n",
+            "2. Apri una cartella con un doppio clic o con Apri e usa Su per risalire. ",
+            "A destra apri la cartella in cui vuoi trasferire i file. A sinistra spunta gli elementi da trasferire. ",
             "Le spunte restano attive quando cambi cartella. Spuntare una cartella include tutto il suo contenuto. ",
             "Sotto l'elenco trovi la dimensione totale degli elementi spuntati in MB o GB. ",
             "Azzera spunte deseleziona tutti gli elementi.\r\n\r\n",
@@ -1404,7 +1549,10 @@ unsafe extern "system" fn procedure(
             SetTextColor(dc, theme::INK);
             SetBkMode(dc, 1);
             let brush = THEME.with_borrow(|theme| theme.as_ref().map(|theme| theme.panel));
-            if control == GetDlgItem(window, ADDRESS) || control == GetDlgItem(window, STATUS) {
+            if [ADDRESS, DESTINATION_ADDRESS, STATUS]
+                .iter()
+                .any(|&id| control == GetDlgItem(window, id))
+            {
                 SetTextColor(dc, theme::MUTED);
                 SetDCBrushColor(dc, theme::rgb(249, 253, 255));
                 return GetStockObject(18) as isize;
@@ -1420,24 +1568,35 @@ unsafe extern "system" fn procedure(
                 help(window);
             } else if !busy() {
                 match (id, code) {
-                    (SOURCE, 1 | 5) if !SETTING_PATHS.get() => {
-                        replace_browser(window, Browser::default());
-                        let notice = physical_disk(&field(window, SOURCE)).map(|disk| disk.notice);
+                    (SOURCE | DESTINATION, 1 | 5) if !SETTING_PATHS.get() => {
+                        let pane = if id == SOURCE {
+                            Pane::Source
+                        } else {
+                            Pane::Destination
+                        };
+                        clear_pane(window, pane);
+                        let notice = physical_disk(&field(window, id)).map(|disk| disk.notice);
                         status(
                             window,
                             notice
                                 .as_deref()
-                                .unwrap_or("Origine aggiornata. Premi Mostra file per sfogliare."),
+                                .unwrap_or("Premi Sfoglia nel pannello per aprire il percorso."),
                         );
                     }
-                    (SOURCE | DESTINATION, 9) if !SETTING_PATHS.get() => {
-                        choose_disk_item(window, id, lparam as Handle);
+                    (SOURCE, 9) if !SETTING_PATHS.get() => {
+                        choose_disk_item(window, Pane::Source, lparam as Handle)
+                    }
+                    (DESTINATION, 9) if !SETTING_PATHS.get() => {
+                        choose_disk_item(window, Pane::Destination, lparam as Handle)
                     }
                     (AUTO, 0) => scan_drives(window, true),
-                    (SHOW, 0) => show_files(window),
+                    (SHOW, 0) => show_files(window, Pane::Source),
+                    (DESTINATION_SHOW, 0) => show_files(window, Pane::Destination),
                     (EJECT, 0) => eject_linux(window, false),
-                    (OPEN, 0) => navigate(window, false),
-                    (UP, 0) => navigate(window, true),
+                    (OPEN, 0) => navigate(window, Pane::Source, false),
+                    (UP, 0) => navigate(window, Pane::Source, true),
+                    (DESTINATION_OPEN, 0) => navigate(window, Pane::Destination, false),
+                    (DESTINATION_UP, 0) => navigate(window, Pane::Destination, true),
                     (SELECT_ALL, 0) => bulk_selection(window, true),
                     (CLEAR, 0) => bulk_selection(window, false),
                     (COPY, 0) => start_transfer(window, Operation::Copy),
@@ -1447,7 +1606,10 @@ unsafe extern "system" fn procedure(
             }
         }
         0x4e if wparam == FILES as usize && lparam != 0 => {
-            return list_notification(window, &*(lparam as *const Notification));
+            return list_notification(window, Pane::Source, &*(lparam as *const Notification));
+        }
+        0x4e if wparam == DESTINATION_FILES as usize && lparam != 0 => {
+            return list_notification(window, Pane::Destination, &*(lparam as *const Notification));
         }
         0x113 if wparam == JOB_TIMER => collect_task(window),
         0x113 if wparam == SELECTION_SIZE_TIMER => poll_selection_size(window),
@@ -1466,6 +1628,7 @@ unsafe extern "system" fn procedure(
             SetTimer(window, DEVICE_TIMER, 400, null_mut());
             return 1;
         }
+        0x10 if EJECT_EXIT.get().is_some() => EJECT_EXIT.set(Some(true)),
         0x10 if busy() => {
             MessageBoxW(
                 window,
@@ -1514,7 +1677,7 @@ fn main() {
             0x12cf_0000,
             i32::MIN,
             i32::MIN,
-            820,
+            1100,
             700,
             null_mut(),
             null_mut(),
@@ -1558,5 +1721,35 @@ mod tests {
 
         browser.selected.clear();
         assert!(browser.selection_summary().ends_with("0 con spunta"));
+    }
+
+    #[test]
+    fn destination_uses_the_open_folder_until_the_input_changes() -> io::Result<()> {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let folder = root.join("src");
+        let typed_folder = root.join("scripts");
+        let file = root.join("README.md");
+
+        let listing = Listing::read(Pane::Destination, root.clone(), root.clone())?;
+        assert!(!listing.can_go_up());
+        let folder_index = listing
+            .entries
+            .iter()
+            .position(|entry| entry.path == folder);
+        assert_eq!(
+            listing.selected_folder(folder_index),
+            Some(folder.as_path())
+        );
+        let file_index = listing.entries.iter().position(|entry| entry.path == file);
+        assert!(file_index.is_some());
+        assert_eq!(listing.selected_folder(file_index), None);
+
+        let listing = Listing::read(Pane::Destination, root.clone(), folder.clone())?;
+        assert!(listing.can_go_up());
+        assert_eq!(listing.current_folder(&root), folder);
+        assert_eq!(listing.current_folder(&typed_folder), typed_folder);
+        let result = Listing::read(Pane::Destination, file.clone(), file);
+        assert_eq!(result.err().unwrap().kind(), io::ErrorKind::NotADirectory);
+        Ok(())
     }
 }

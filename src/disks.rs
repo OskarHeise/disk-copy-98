@@ -72,7 +72,7 @@ fn parse_disk(line: &str) -> Option<Disk> {
     };
     let label = format!("{name} ({bus}, {reason})");
     let detail = if mountable {
-        "Premi Mostra file per aprire il disco tramite WSL."
+        "Premi Sfoglia per aprire il disco tramite WSL."
     } else {
         "Windows non espone un volume da sfogliare."
     };
@@ -129,6 +129,6 @@ mod tests {
         assert!(disk.usb);
         assert_eq!(disk.label, "Disco 1 · SAMSUNG HD103UJ (USB, RAW)");
         assert!(!std::path::Path::new(&disk.label).is_absolute());
-        assert!(disk.notice.contains("Premi Mostra file"));
+        assert!(disk.notice.contains("Premi Sfoglia"));
     }
 }

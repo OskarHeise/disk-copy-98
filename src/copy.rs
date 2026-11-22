@@ -125,7 +125,7 @@ fn wsl_permission_denied(path: &Path, error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::PermissionDenied && wsl_path(path)
 }
 
-pub fn list(root: &Path, directory: &Path) -> io::Result<Vec<Entry>> {
+pub fn list(root: &Path, directory: &Path, allow_file: bool) -> io::Result<Vec<Entry>> {
     let mut entries = Vec::new();
     let metadata = source_metadata(root, directory)?;
     if metadata.is_dir() {
@@ -151,6 +151,11 @@ pub fn list(root: &Path, directory: &Path) -> io::Result<Vec<Entry>> {
                     .cmp(b.path.file_name().unwrap_or_default())
             })
         });
+    } else if !allow_file {
+        return Err(io::Error::new(
+            io::ErrorKind::NotADirectory,
+            "La destinazione deve essere una cartella.",
+        ));
     } else if metadata.is_file() {
         entries.push(Entry {
             path: directory.into(),
@@ -801,10 +806,10 @@ mod tests {
         let file = source.join("foto città.txt");
         fs::write(&file, b"photo")?;
         fs::write(source.join("other.txt"), b"other")?;
-        let entries = list(&source, &source)?;
+        let entries = list(&source, &source, true)?;
         assert_eq!(entries.len(), 3);
         assert!(entries[0].directory);
-        let entries = list(&file, &file)?;
+        let entries = list(&file, &file, true)?;
         assert_eq!(entries[0].path, file);
         assert_eq!(entries[0].length, 5);
 
