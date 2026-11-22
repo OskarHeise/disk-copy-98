@@ -1,7 +1,9 @@
 use std::{
+    ffi::OsStr,
     fs::{self, File, Metadata, OpenOptions},
     io::{self, Read, Write},
     os::windows::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
         io::{AsRawHandle, RawHandle},
     },
@@ -13,6 +15,7 @@ use std::{
 extern "system" {
     fn SetFileInformationByHandle(file: RawHandle, class: i32, info: *const u8, size: u32) -> i32;
     fn GetFileInformationByHandle(file: RawHandle, information: *mut FileInformation) -> i32;
+    fn MoveFileExW(source: *const u16, target: *const u16, flags: u32) -> i32;
 }
 
 const FILE_SHARE_READ: u32 = 1;
@@ -81,13 +84,26 @@ pub struct Progress {
 struct Transfer<'a> {
     operation: Operation,
     keep_both: bool,
+    merge_folders: bool,
     report: Report,
     progress: Progress,
     buffer: Vec<u8>,
     notify: &'a mut dyn FnMut(Progress),
 }
 
-impl Transfer<'_> {
+impl<'a> Transfer<'a> {
+    fn new(operation: Operation, keep_both: bool, notify: &'a mut dyn FnMut(Progress)) -> Self {
+        Self {
+            operation,
+            keep_both,
+            merge_folders: true,
+            report: Report::default(),
+            progress: Progress::default(),
+            buffer: vec![0; 1024 * 1024],
+            notify,
+        }
+    }
+
     fn advance(&mut self, units: u64, written: u64) {
         self.progress.processed = self.progress.processed.saturating_add(units);
         self.progress.written = self.progress.written.saturating_add(written);
@@ -164,6 +180,173 @@ pub fn list(root: &Path, directory: &Path, allow_file: bool) -> io::Result<Vec<E
         });
     }
     Ok(entries)
+}
+
+pub fn validate_name(name: &OsStr) -> io::Result<()> {
+    let name = name.to_string_lossy();
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches(' ');
+    let stem = stem.to_ascii_uppercase();
+    let reserved = matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || ["COM", "LPT"].into_iter().any(|prefix| {
+        stem.strip_prefix(prefix).is_some_and(|suffix| {
+            matches!(
+                suffix,
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+            )
+        })
+    });
+    if name.is_empty()
+        || name.ends_with(['.', ' '])
+        || name
+            .chars()
+            .any(|ch| ch < ' ' || "<>:\"/\\|?*".contains(ch))
+        || reserved
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Inserisci un nome valido per un singolo file o cartella.",
+        ));
+    }
+    Ok(())
+}
+
+pub fn create_item(root: &Path, directory: &Path, name: &OsStr, folder: bool) -> io::Result<()> {
+    validate_name(name)?;
+    if !source_metadata(root, directory)?.is_dir() {
+        return Err(io::ErrorKind::NotADirectory.into());
+    }
+    let target = directory.join(name);
+    let result = if folder {
+        fs::create_dir(&target)
+    } else {
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+            .map(drop)
+    };
+    result.map_err(|error| at(&target, error))
+}
+
+fn item_metadata(root: &Path, item: &Path, folder: bool) -> io::Result<Metadata> {
+    let metadata = source_metadata(root, item).map_err(|error| at(item, error))?;
+    if (folder && item != root && metadata.is_dir()) || (!folder && metadata.is_file()) {
+        Ok(metadata)
+    } else {
+        Err(at(
+            item,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "La voce è cambiata. Aggiorna il pannello con Sfoglia.",
+            ),
+        ))
+    }
+}
+
+pub fn delete_item(root: &Path, item: &Path, folder: bool) -> io::Result<()> {
+    item_metadata(root, item, folder)?;
+    let result = if folder {
+        fs::remove_dir_all(item).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{error} Parte del contenuto potrebbe essere già stata eliminata."),
+            )
+        })
+    } else {
+        fs::remove_file(item)
+    };
+    result.map_err(|error| at(item, error))
+}
+
+pub fn move_item(
+    root: &Path,
+    item: &Path,
+    folder: bool,
+    destination: &Path,
+    notify: &mut dyn FnMut(Progress),
+) -> io::Result<()> {
+    let metadata = item_metadata(root, item, folder)?;
+    let name = item.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+    validate_name(name)?;
+    let parent = item.parent().ok_or(io::ErrorKind::InvalidInput)?;
+    let source = fs::canonicalize(parent)
+        .map_err(|error| at(parent, error))?
+        .join(name);
+    let destination = fs::canonicalize(destination).map_err(|error| at(destination, error))?;
+    if !fs::metadata(&destination)?.is_dir() {
+        return Err(at(&destination, io::ErrorKind::NotADirectory.into()));
+    }
+    let target = destination.join(name);
+    check_overlap(&source, &target, &metadata)?;
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Err(at(&target, name_conflict())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(at(&target, error)),
+    }
+
+    let source_wide: Vec<_> = source.as_os_str().encode_wide().chain([0]).collect();
+    let target_wide: Vec<_> = target.as_os_str().encode_wide().chain([0]).collect();
+    // A native move preserves metadata on the same volume and never replaces the target.
+    if unsafe { MoveFileExW(source_wide.as_ptr(), target_wide.as_ptr(), 0) } != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    const ERROR_NOT_SAME_DEVICE: i32 = 17;
+    if error.raw_os_error() != Some(ERROR_NOT_SAME_DEVICE)
+        && normalized(&source).components().next() == normalized(&target).components().next()
+    {
+        return Err(at(&source, error));
+    }
+
+    move_across_volumes(&source, &target, metadata, notify)
+}
+
+fn name_conflict() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "Esiste già un elemento con questo nome.",
+    )
+}
+
+fn move_across_volumes(
+    source: &Path,
+    target: &Path,
+    metadata: Metadata,
+    notify: &mut dyn FnMut(Progress),
+) -> io::Result<()> {
+    let mut transfer = Transfer::new(Operation::Move, false, notify);
+    transfer.merge_folders = false;
+    transfer.progress.total = measure(source, &metadata);
+    transfer.advance(0, 0);
+    if metadata.is_dir() {
+        // Reserve the top-level name so a folder created by another process cannot be merged.
+        fs::create_dir(target).map_err(|error| at(target, error))?;
+        transfer_directory(source, target, &mut transfer).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "{} Alcuni elementi potrebbero essere già stati spostati.",
+                    at(source, error)
+                ),
+            )
+        })?;
+    } else {
+        transfer_entry(source, target, metadata, &mut transfer)?;
+    }
+    if transfer.report.skipped > 0 {
+        return Err(io::Error::other(format!(
+            "Spostamento parziale. {} elementi saltati.\r\n\r\n{}",
+            transfer.report.skipped,
+            transfer.report.skip_details.join("\r\n\r\n")
+        )));
+    }
+    Ok(())
 }
 
 fn source_metadata(root: &Path, path: &Path) -> io::Result<Metadata> {
@@ -291,14 +474,7 @@ pub fn transfer(
     keep_both: bool,
     notify: &mut dyn FnMut(Progress),
 ) -> io::Result<Report> {
-    let mut transfer = Transfer {
-        operation,
-        keep_both,
-        report: Report::default(),
-        progress: Progress::default(),
-        buffer: vec![0; 1024 * 1024],
-        notify,
-    };
+    let mut transfer = Transfer::new(operation, keep_both, notify);
     if selected.is_empty() && operation == Operation::Copy {
         copy_all(source, destination, &mut transfer)?;
     } else {
@@ -522,6 +698,52 @@ fn remove_transferred_file(input: File, source: &Path) -> io::Result<()> {
     }
 }
 
+fn transfer_directory(source: &Path, target: &Path, transfer: &mut Transfer) -> io::Result<()> {
+    let operation = transfer.operation;
+    let entries = match fs::read_dir(source) {
+        Err(error) if operation == Operation::Copy && wsl_permission_denied(source, &error) => {
+            transfer.skip(source, "Accesso alla cartella di origine negato.", 1);
+            return Ok(());
+        }
+        result => result?,
+    };
+    let skipped = transfer.report.skipped;
+    for entry in entries.collect::<io::Result<Vec<_>>>()? {
+        let name = entry.file_name();
+        if !transfer.merge_folders {
+            if let Err(error) = validate_name(&name) {
+                transfer.skip(&entry.path(), &error.to_string(), 1);
+                continue;
+            }
+        }
+        let metadata = match entry.metadata() {
+            Err(error) if operation == Operation::Copy && wsl_permission_denied(source, &error) => {
+                transfer.skip(&entry.path(), "Accesso all'origine negato.", 1);
+                continue;
+            }
+            result => result?,
+        };
+        transfer_entry(&entry.path(), &target.join(name), metadata, transfer)?;
+    }
+    if operation == Operation::Copy {
+        transfer.report.folders += 1;
+    } else if skipped == transfer.report.skipped {
+        match fs::remove_dir(source) {
+            Ok(()) => transfer.report.folders += 1,
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                transfer.skip(
+                    source,
+                    "La cartella di origine contiene ancora elementi.",
+                    0,
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    transfer.advance(1, 0);
+    Ok(())
+}
+
 fn transfer_one(
     source: &Path,
     target: &Path,
@@ -532,7 +754,12 @@ fn transfer_one(
     if is_link(&metadata) {
         transfer.skip(source, "Collegamento all'origine.", 1);
     } else if metadata.is_dir() {
-        if !ensure_directory(target).map_err(|error| at(target, error))? {
+        let created = if transfer.merge_folders {
+            ensure_directory(target)
+        } else {
+            fs::create_dir(target).map(|()| true)
+        };
+        if !created.map_err(|error| at(target, error))? {
             transfer.skip(
                 target,
                 "La cartella di destinazione è occupata da un file o collegamento.",
@@ -540,47 +767,7 @@ fn transfer_one(
             );
             return Ok(());
         }
-        let entries = match fs::read_dir(source) {
-            Err(error) if operation == Operation::Copy && wsl_permission_denied(source, &error) => {
-                transfer.skip(source, "Accesso alla cartella di origine negato.", 1);
-                return Ok(());
-            }
-            result => result?,
-        };
-        let skipped = transfer.report.skipped;
-        for entry in entries.collect::<io::Result<Vec<_>>>()? {
-            let metadata = match entry.metadata() {
-                Err(error)
-                    if operation == Operation::Copy && wsl_permission_denied(source, &error) =>
-                {
-                    transfer.skip(&entry.path(), "Accesso all'origine negato.", 1);
-                    continue;
-                }
-                result => result?,
-            };
-            transfer_entry(
-                &entry.path(),
-                &target.join(entry.file_name()),
-                metadata,
-                transfer,
-            )?;
-        }
-        if operation == Operation::Copy {
-            transfer.report.folders += 1;
-        } else if skipped == transfer.report.skipped {
-            match fs::remove_dir(source) {
-                Ok(()) => transfer.report.folders += 1,
-                Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
-                    transfer.skip(
-                        source,
-                        "La cartella di origine contiene ancora elementi.",
-                        0,
-                    );
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        transfer.advance(1, 0);
+        transfer_directory(source, target, transfer)?;
     } else if metadata.is_file() {
         let units = metadata.len().saturating_add(1);
         let mut input = if operation == Operation::Move {
@@ -685,6 +872,115 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn creates_items_exclusively_and_rejects_invalid_names() -> io::Result<()> {
+        let fixture = Fixture::new("create-items")?;
+        let root = &fixture.0;
+        let folder = OsStr::new("Città");
+        create_item(root, root, folder, true)?;
+        let directory = root.join(folder);
+        let name = OsStr::new("nota.txt");
+        create_item(root, &directory, name, false)?;
+        let file = directory.join(name);
+        assert_eq!(fs::metadata(&file)?.len(), 0);
+        fs::write(&file, b"keep")?;
+        assert_eq!(
+            create_item(root, &directory, name, false)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&file)?, b"keep");
+        for name in [
+            "",
+            "..",
+            "../outside",
+            "a:b",
+            "nul.txt",
+            "COM¹",
+            "name.",
+            "name ",
+        ] {
+            assert_eq!(
+                validate_name(OsStr::new(name)).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deletes_a_file_and_a_nonempty_folder_without_deleting_the_root() -> io::Result<()> {
+        let fixture = Fixture::new("delete-items")?;
+        let root = &fixture.0;
+        let folder = root.join("folder");
+        let file = root.join("file.txt");
+        fs::create_dir_all(folder.join("nested"))?;
+        fs::write(folder.join("nested/inside.txt"), b"inside")?;
+        fs::write(&file, b"file")?;
+        assert!(delete_item(root, root, true).is_err());
+        assert!(delete_item(root, &folder, false).is_err());
+        assert!(delete_item(root, &file, true).is_err());
+        delete_item(root, &file, false)?;
+        delete_item(root, &folder, true)?;
+        assert_eq!(fs::read_dir(root)?.count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn moves_within_the_browsed_root_and_protects_conflicts() -> io::Result<()> {
+        let fixture = Fixture::new("move-within-root")?;
+        let root = &fixture.0;
+        let folder = root.join("photos");
+        let target = root.join("archive");
+        fs::create_dir_all(folder.join("nested"))?;
+        fs::create_dir(&target)?;
+        let file = folder.join("photo.jpg");
+        fs::write(&file, b"photo")?;
+        fs::write(target.join("photo.jpg"), b"original")?;
+        assert_eq!(
+            move_item(root, &file, false, &target, &mut |_| {})
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&file)?, b"photo");
+        assert_eq!(fs::read(target.join("photo.jpg"))?, b"original");
+        assert!(move_item(root, &folder, true, &folder.join("nested"), &mut |_| {}).is_err());
+        move_item(root, &folder, true, &target, &mut |_| {})?;
+        assert!(!folder.exists());
+        let moved_file = target.join("photos/photo.jpg");
+        move_item(root, &moved_file, false, root, &mut |_| {})?;
+        assert!(!moved_file.exists());
+        assert_eq!(fs::read(root.join("photo.jpg"))?, b"photo");
+        assert!(target.join("photos/nested").is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn cross_volume_fallback_reserves_the_folder_and_moves_its_contents() -> io::Result<()> {
+        let fixture = Fixture::new("move-between-volumes")?;
+        let folder = fixture.0.join("source");
+        let target = fixture.0.join("target");
+        fs::create_dir_all(folder.join("nested/empty"))?;
+        fs::write(folder.join("nested/file.txt"), b"contents")?;
+        fs::create_dir(&target)?;
+        let metadata = fs::symlink_metadata(&folder)?;
+        assert_eq!(
+            move_across_volumes(&folder, &target, metadata.clone(), &mut |_| {})
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        assert!(folder.join("nested/file.txt").exists());
+        fs::remove_dir(&target)?;
+        move_across_volumes(&folder, &target, metadata, &mut |_| {})?;
+        assert!(!folder.exists());
+        assert_eq!(fs::read(target.join("nested/file.txt"))?, b"contents");
+        assert!(target.join("nested/empty").is_dir());
+        Ok(())
     }
 
     #[test]

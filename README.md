@@ -1,6 +1,6 @@
 # Disk Copy 98
 
-Disk Copy 98 è un’app portatile per copiare e spostare file e cartelle su Windows. Funziona con unità locali, chiavette USB e percorsi di rete. Tramite WSL 2 può aprire anche volumi Linux che Windows mostra senza lettera o come **RAW**, tra cui alcuni dischi di NAS ReadyNAS.
+Disk Copy 98 è un’app portatile per copiare, creare, spostare ed eliminare file e cartelle su Windows. Funziona con unità locali, chiavette USB e percorsi di rete. Tramite WSL 2 può aprire anche volumi Linux che Windows mostra senza lettera o come **RAW**, tra cui alcuni dischi di NAS ReadyNAS.
 
 ## Scarica e avvia
 
@@ -30,6 +30,18 @@ L’app conserva i percorsi relativi. Se in `E:\Foto` selezioni `2025\Vacanze\ma
 Il riepilogo indica il motivo e il percorso degli elementi saltati. Un risultato come **0 file spostati, 1 saltato** può comparire se in destinazione esiste già un elemento con lo stesso nome. Spunta **Mantieni entrambi se il nome esiste già** e riprova per salvare il file in arrivo come `mare (1).jpg`, conservando quello esistente. In alternativa, scegli una cartella di destinazione diversa.
 
 I collegamenti vengono saltati. Se un errore interrompe il trasferimento, gli elementi già trasferiti restano in destinazione. Se la copia di un file riesce ma la rimozione fallisce, l’app segnala l’errore e il file resta anche all’origine.
+
+## Gestisci file e cartelle
+
+Puoi usare i comandi di gestione in entrambi i pannelli, nella cartella indicata sopra l’elenco.
+
+| Comando | Come funziona |
+| --- | --- |
+| **Nuovo file…** o **Nuova cartella…** | Inserisci un nome e premi **Crea** per aggiungere un file vuoto o una cartella vuota. |
+| **Sposta…** | Evidenzia una riga, indica una cartella esistente e premi **Sposta**. Puoi scegliere una cartella dello stesso disco o di un’altra unità. Se è aperta una cartella nell’altro pannello, l’app ne propone il percorso. |
+| **Elimina…** | Evidenzia una riga e conferma dopo aver verificato il percorso. L’eliminazione salta il Cestino. Quando elimini una cartella, rimuovi anche tutto il suo contenuto. |
+
+**Sposta…** conserva il nome dell’elemento e si ferma se quel nome è già presente nella cartella di arrivo. Per trasferire più elementi insieme, usa le spunte a sinistra e **Sposta selezione**. I pannelli si aggiornano dopo ogni operazione.
 
 ## Installa WSL 2
 
@@ -78,7 +90,7 @@ winget install --interactive --exact --id dorssel.usbipd-win
 
 ### Dischi da NAS ReadyNAS SPARC
 
-L’app riconosce alcuni layout ReadyNAS legacy, come quello verificato sul **Samsung HD103UJ**. Può aprire un volume dati ext su un disco con un singolo volume LVM lineare. La copia parte in sola lettura. Per il layout ReadyNAS SPARC supportato, **Sposta selezione** controlla il filesystem, abilita la scrittura per il trasferimento e ripristina la sola lettura al termine. Se il filesystem richiede un controllo oppure il volume dipende da più dischi, può essere necessario usare il NAS originale o uno strumento di recupero.
+L’app riconosce alcuni layout ReadyNAS legacy, come quello verificato sul **Samsung HD103UJ**. Può aprire un volume dati ext su un disco con un singolo volume LVM lineare. La copia parte in sola lettura. Per il layout ReadyNAS SPARC supportato, quando confermi un’operazione di gestione o uno spostamento, l’app controlla il filesystem, apre il volume in scrittura e ripristina la sola lettura al termine. Se il filesystem richiede un controllo oppure il volume dipende da più dischi, può essere necessario usare il NAS originale o uno strumento di recupero.
 
 Su Ubuntu o Debian l’app prova a installare `lvm2` e `fuse2fs` al bisogno. Se l’installazione automatica fallisce, puoi installarli dal terminale di Ubuntu e riprovare.
 

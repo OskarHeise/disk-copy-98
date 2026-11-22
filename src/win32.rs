@@ -4,6 +4,20 @@ pub type Handle = *mut c_void;
 type WindowProc = unsafe extern "system" fn(Handle, u32, usize, isize) -> isize;
 
 #[repr(C)]
+pub struct EmptyDialogTemplate {
+    pub style: u32,
+    pub extended_style: u32,
+    pub controls: u16,
+    pub x: i16,
+    pub y: i16,
+    pub width: i16,
+    pub height: i16,
+    pub menu: u16,
+    pub class: u16,
+    pub title: u16,
+}
+
+#[repr(C)]
 pub struct WindowClass {
     pub style: u32,
     pub procedure: WindowProc,
@@ -151,6 +165,14 @@ extern "system" {
     pub fn SetTimer(window: Handle, id: usize, interval: u32, callback: Handle) -> usize;
     pub fn KillTimer(window: Handle, id: usize) -> i32;
     pub fn MessageBoxW(window: Handle, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    pub fn DialogBoxIndirectParamW(
+        instance: Handle,
+        template: *const EmptyDialogTemplate,
+        parent: Handle,
+        procedure: WindowProc,
+        parameter: isize,
+    ) -> isize;
+    pub fn EndDialog(window: Handle, result: isize) -> i32;
     pub fn MoveWindow(window: Handle, x: i32, y: i32, cx: i32, cy: i32, repaint: i32) -> i32;
     pub fn GetClientRect(window: Handle, rect: *mut Rect) -> i32;
     pub fn InvalidateRect(window: Handle, rect: *const Rect, erase: i32) -> i32;

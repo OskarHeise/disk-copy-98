@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod copy;
+mod dialog;
 mod disks;
 mod linux;
 mod theme;
@@ -50,9 +51,11 @@ const DESTINATION_OPEN: i32 = 122;
 const DESTINATION_UP: i32 = 123;
 const DESTINATION_ADDRESS: i32 = 124;
 const DESTINATION_FILES: i32 = 125;
+const SOURCE_ACTIONS: i32 = 126;
+const DESTINATION_ACTIONS: i32 = 130;
 const APP_ICON_RESOURCE: u16 = 101;
 const MIN_WIDTH: i32 = 920;
-const MIN_HEIGHT: i32 = 560;
+const MIN_HEIGHT: i32 = 600;
 const JOB_TIMER: usize = 1;
 const DEVICE_TIMER: usize = 2;
 const SELECTION_SIZE_TIMER: usize = 3;
@@ -71,6 +74,7 @@ struct PaneControls {
     up: i32,
     address: i32,
     files: i32,
+    actions: i32,
 }
 
 impl Pane {
@@ -84,6 +88,7 @@ impl Pane {
                 up: UP,
                 address: ADDRESS,
                 files: FILES,
+                actions: SOURCE_ACTIONS,
             },
             Self::Destination => PaneControls {
                 label: DESTINATION_LABEL,
@@ -93,6 +98,7 @@ impl Pane {
                 up: DESTINATION_UP,
                 address: DESTINATION_ADDRESS,
                 files: DESTINATION_FILES,
+                actions: DESTINATION_ACTIONS,
             },
         }
     }
@@ -103,6 +109,44 @@ impl Pane {
             Self::Destination => DESTINATION_VIEW.with_borrow(read),
         }
     }
+
+    fn opposite(self) -> Self {
+        match self {
+            Self::Source => Self::Destination,
+            Self::Destination => Self::Source,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FileAction {
+    NewFile,
+    NewFolder,
+    Move,
+    Delete,
+}
+
+const FILE_ACTIONS: [(FileAction, &str, i32); 4] = [
+    (FileAction::NewFile, "Nuovo file…", 88),
+    (FileAction::NewFolder, "Nuova cartella…", 111),
+    (FileAction::Move, "Sposta…", 74),
+    (FileAction::Delete, "Elimina…", 74),
+];
+
+enum FileChange {
+    Create {
+        name: OsString,
+        folder: bool,
+    },
+    Move {
+        item: PathBuf,
+        folder: bool,
+        destination: PathBuf,
+    },
+    Delete {
+        item: PathBuf,
+        folder: bool,
+    },
 }
 
 #[derive(Default)]
@@ -191,6 +235,33 @@ impl Listing {
             input
         }
     }
+
+    fn is_folder(&self) -> bool {
+        self.directory.is_absolute()
+            && !self
+                .entries
+                .iter()
+                .any(|entry| entry.path == self.directory)
+    }
+
+    fn refresh(pane: Pane, root: PathBuf, directory: PathBuf) -> Self {
+        if root.as_os_str().is_empty() {
+            return Self::default();
+        }
+        for directory in directory
+            .ancestors()
+            .take_while(|path| path.starts_with(&root))
+        {
+            if let Ok(entries) = copy::list(&root, directory, pane == Pane::Source) {
+                return Self {
+                    directory: directory.into(),
+                    root,
+                    entries,
+                };
+            }
+        }
+        Self::default()
+    }
 }
 
 enum TaskResult {
@@ -214,6 +285,11 @@ enum TaskResult {
         source: Option<Browser>,
         destination: Option<Listing>,
     },
+    FileChange {
+        result: io::Result<String>,
+        source: Browser,
+        destination: Listing,
+    },
 }
 
 type TransferProgress = Arc<Mutex<Option<copy::Progress>>>;
@@ -228,6 +304,7 @@ thread_local! {
     static SIZE_TASK: RefCell<Option<SizeTask>> = const { RefCell::new(None) };
     static ACTIVE_PROGRESS: RefCell<Option<(Operation, TransferProgress)>> = const { RefCell::new(None) };
     static REDRAW_LIST: Cell<bool> = const { Cell::new(false) };
+    static FILE_PROMPT_OPEN: Cell<bool> = const { Cell::new(false) };
     static SETTING_PATHS: Cell<bool> = const { Cell::new(false) };
     static DISKS_WITHOUT_DRIVE_LETTERS: RefCell<Vec<disks::Disk>> = const { RefCell::new(Vec::new()) };
     static MOUNTED_DISKS: RefCell<Vec<linux::MountedDisk>> = const { RefCell::new(Vec::new()) };
@@ -310,6 +387,16 @@ unsafe fn setup(window: Handle) {
         if pane == Pane::Source {
             control(window, "BUTTON", "Spunta tutti", SELECT_ALL, BUTTON, 0);
             control(window, "BUTTON", "Azzera spunte", CLEAR, BUTTON, 0);
+        }
+        for (action, label, _) in FILE_ACTIONS {
+            control(
+                window,
+                "BUTTON",
+                label,
+                ids.actions + action as i32,
+                BUTTON,
+                0,
+            );
         }
         control(window, "STATIC", "", ids.address, 0x80c0, 0x200);
         let list = control(
@@ -401,7 +488,18 @@ unsafe fn layout(window: Handle) {
         place(ids.show, x, FILES_TOP + 71, 78, 27);
         place(ids.open, x + 85, FILES_TOP + 71, 48, 27);
         place(ids.up, x + 140, FILES_TOP + 71, 40, 27);
-        place(ids.address, x, FILES_TOP + 106, inner, 23);
+        let mut action_x = x;
+        for (action, _, width) in FILE_ACTIONS {
+            place(
+                ids.actions + action as i32,
+                action_x,
+                FILES_TOP + 105,
+                width,
+                27,
+            );
+            action_x += width + 7;
+        }
+        place(ids.address, x, FILES_TOP + 140, inner, 23);
         let list_bottom = if pane == Pane::Source {
             footer - 59
         } else {
@@ -410,9 +508,9 @@ unsafe fn layout(window: Handle) {
         place(
             ids.files,
             x,
-            FILES_TOP + 137,
+            FILES_TOP + 171,
             inner,
-            list_bottom - FILES_TOP - 137,
+            list_bottom - FILES_TOP - 171,
         );
         SendMessageW(
             GetDlgItem(window, ids.files),
@@ -812,6 +910,238 @@ unsafe fn navigate(window: Handle, pane: Pane, up: bool) {
     }
 }
 
+unsafe fn request_file_change(
+    window: Handle,
+    pane: Pane,
+    action: FileAction,
+    directory: &Path,
+    item: Option<(PathBuf, bool)>,
+) -> Option<FileChange> {
+    match action {
+        FileAction::NewFile | FileAction::NewFolder => {
+            let folder = matches!(action, FileAction::NewFolder);
+            let mut name = OsString::new();
+            let title = if folder {
+                "Nuova cartella"
+            } else {
+                "Nuovo file"
+            };
+            loop {
+                name = dialog::text_prompt(
+                    window,
+                    &dialog::TextPrompt {
+                        title,
+                        context_label: "Crea in questa cartella",
+                        context: directory.as_os_str(),
+                        input_label: "Nome",
+                        initial: &name,
+                        submit: "Crea",
+                    },
+                )?;
+                match copy::validate_name(&name) {
+                    Ok(()) => return Some(FileChange::Create { name, folder }),
+                    Err(error) => file_notice(window, title, &error.to_string()),
+                }
+            }
+        }
+        FileAction::Move => {
+            let (item, folder) = item?;
+            let mut destination = pane.opposite().with_listing(|view| {
+                if view.is_folder() {
+                    view.directory.clone()
+                } else {
+                    PathBuf::new()
+                }
+            });
+            loop {
+                destination = dialog::text_prompt(
+                    window,
+                    &dialog::TextPrompt {
+                        title: "Conferma spostamento",
+                        context_label: if folder {
+                            "Cartella da spostare"
+                        } else {
+                            "File da spostare"
+                        },
+                        context: item.as_os_str(),
+                        input_label: "Percorso della cartella di destinazione",
+                        initial: destination.as_os_str(),
+                        submit: "Sposta",
+                    },
+                )?
+                .into();
+                let error = if !destination.is_absolute() {
+                    "Indica il percorso assoluto di una cartella esistente."
+                } else if !can_write(&destination) {
+                    "La cartella di destinazione è in sola lettura."
+                } else {
+                    return Some(FileChange::Move {
+                        item,
+                        folder,
+                        destination,
+                    });
+                };
+                file_notice(window, "Sposta", error);
+            }
+        }
+        FileAction::Delete => {
+            let (item, folder) = item?;
+            let prompt = format!(
+                "Eliminare definitivamente {}?\r\n\r\n{}\r\n\r\nL'operazione salta il Cestino.",
+                if folder {
+                    "la cartella e tutto il suo contenuto"
+                } else {
+                    "il file"
+                },
+                item.display(),
+            );
+            (MessageBoxW(
+                window,
+                wide(&prompt).as_ptr(),
+                wide("Conferma eliminazione").as_ptr(),
+                0x124,
+            ) == 6)
+                .then_some(FileChange::Delete { item, folder })
+        }
+    }
+}
+
+unsafe fn file_notice(window: Handle, title: &str, message: &str) {
+    MessageBoxW(window, wide(message).as_ptr(), wide(title).as_ptr(), 0x30);
+}
+
+unsafe fn manage_files(window: Handle, pane: Pane, action: FileAction) {
+    let index = highlighted(window, pane);
+    let (root, directory, is_folder, item) = pane.with_listing(|view| {
+        (
+            view.root.clone(),
+            view.directory.clone(),
+            view.is_folder(),
+            index
+                .and_then(|index| view.entries.get(index))
+                .map(|entry| (entry.path.clone(), entry.directory)),
+        )
+    });
+    let creating = matches!(action, FileAction::NewFile | FileAction::NewFolder);
+    let path = if creating && is_folder {
+        directory.as_path()
+    } else if !creating {
+        let Some((item, _)) = &item else {
+            return;
+        };
+        item.as_path()
+    } else {
+        return;
+    };
+    if !can_write(path) {
+        return;
+    }
+    let source_access = linux_write_access(path);
+    FILE_PROMPT_OPEN.set(true);
+    let change = request_file_change(window, pane, action, &directory, item);
+    FILE_PROMPT_OPEN.set(false);
+    let Some(change) = change else {
+        return;
+    };
+
+    let destination_access = match &change {
+        FileChange::Move { destination, .. } => {
+            linux_write_access(destination).filter(|access| Some(access) != source_access.as_ref())
+        }
+        _ => None,
+    };
+    let (source_root, source_directory, selected) = UI.with_borrow(|ui| {
+        (
+            ui.listing.root.clone(),
+            ui.listing.directory.clone(),
+            ui.selected.iter().cloned().collect(),
+        )
+    });
+    let (destination_root, destination_directory) =
+        Pane::Destination.with_listing(|view| (view.root.clone(), view.directory.clone()));
+    let moving = matches!(action, FileAction::Move);
+    let progress: TransferProgress = Arc::new(Mutex::new(None));
+    let worker_progress = Arc::clone(&progress);
+    queue_selection_size(window);
+    launch(
+        window,
+        Some(match action {
+            FileAction::NewFile => "Creazione del file…",
+            FileAction::NewFolder => "Creazione della cartella…",
+            FileAction::Move => "Preparazione dello spostamento…",
+            FileAction::Delete => "Eliminazione in corso…",
+        }),
+        move || {
+            let apply = || match change {
+                FileChange::Create { name, folder } => {
+                    copy::create_item(&root, &directory, &name, folder)?;
+                    Ok(format!(
+                        "{}  {}",
+                        if folder {
+                            "Cartella creata"
+                        } else {
+                            "File creato"
+                        },
+                        directory.join(name).display()
+                    ))
+                }
+                FileChange::Move {
+                    item,
+                    folder,
+                    destination,
+                } => {
+                    copy::move_item(&root, &item, folder, &destination, &mut |update| {
+                        *worker_progress.lock().unwrap() = Some(update);
+                    })?;
+                    Ok(format!(
+                        "{} in {}",
+                        if folder {
+                            "Cartella spostata"
+                        } else {
+                            "File spostato"
+                        },
+                        destination.display()
+                    ))
+                }
+                FileChange::Delete { item, folder } => {
+                    copy::delete_item(&root, &item, folder)?;
+                    Ok(format!(
+                        "{}  {}",
+                        if folder {
+                            "Cartella eliminata"
+                        } else {
+                            "File eliminato"
+                        },
+                        item.display()
+                    ))
+                }
+            };
+            let apply = || match destination_access {
+                Some(access) => access.run(apply),
+                None => apply(),
+            };
+            let result = match source_access {
+                Some(access) => access.run(apply),
+                None => apply(),
+            };
+            TaskResult::FileChange {
+                result,
+                source: refresh_source(source_root, source_directory, selected),
+                destination: Listing::refresh(
+                    Pane::Destination,
+                    destination_root,
+                    destination_directory,
+                ),
+            }
+        },
+    );
+    if moving && busy() {
+        show_progress(window, Operation::Move, progress);
+    } else {
+        ShowWindow(GetDlgItem(window, PROGRESS), 0);
+    }
+}
+
 unsafe fn start_transfer(window: Handle, operation: Operation) {
     if busy() {
         return;
@@ -829,7 +1159,7 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
     let destination =
         DESTINATION_VIEW.with_borrow(|view| view.current_folder(&destination_root).to_path_buf());
     let moving = operation == Operation::Move;
-    let move_access = moving.then(|| linux_move_access(&source)).flatten();
+    let move_access = moving.then(|| linux_write_access(&source)).flatten();
     if readonly_volume(&destination)
         || (moving && move_access.is_none() && readonly_volume(&source))
     {
@@ -937,7 +1267,7 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
                     (message.clone(), Some(message))
                 }
             };
-            let source = moving.then(|| refresh_after_move(source, directory, selected));
+            let source = moving.then(|| refresh_source(source, directory, selected));
             let destination = Listing::read(Pane::Destination, destination_root, destination).ok();
             TaskResult::Transfer {
                 message,
@@ -949,11 +1279,15 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
         },
     );
     if busy() {
-        ACTIVE_PROGRESS.with(|active| active.replace(Some((operation, progress))));
-        let bar = GetDlgItem(window, PROGRESS);
-        SendMessageW(bar, PBM_SETPOS, 0, 0);
-        ShowWindow(bar, 5);
+        show_progress(window, operation, progress);
     }
+}
+
+unsafe fn show_progress(window: Handle, operation: Operation, progress: TransferProgress) {
+    ACTIVE_PROGRESS.with(|active| active.replace(Some((operation, progress))));
+    let bar = GetDlgItem(window, PROGRESS);
+    SendMessageW(bar, PBM_SETPOS, 0, 0);
+    ShowWindow(bar, 5);
 }
 
 fn display_bytes(bytes: u64) -> String {
@@ -1046,44 +1380,40 @@ fn readonly_volume(path: &Path) -> bool {
         disks
             .iter()
             .flat_map(|disk| &disk.volumes)
-            .any(|volume| volume.readonly && path.starts_with(&volume.path))
+            .any(|volume| volume.readonly && volume.contains(path))
     })
 }
 
-fn linux_move_access(path: &Path) -> Option<linux::MoveAccess> {
+fn linux_write_access(path: &Path) -> Option<linux::WriteAccess> {
     MOUNTED_DISKS.with_borrow(|disks| {
         disks
             .iter()
             .flat_map(|disk| &disk.volumes)
-            .find(|volume| path.starts_with(&volume.path))
-            .and_then(|volume| volume.move_access.clone())
+            .find(|volume| volume.contains(path))
+            .and_then(|volume| volume.write_access.clone())
     })
 }
 
-fn refresh_after_move(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>) -> Browser {
+fn can_write(path: &Path) -> bool {
+    !readonly_volume(path) || linux_write_access(path).is_some()
+}
+
+fn refresh_source(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>) -> Browser {
+    let listing = Listing::refresh(Pane::Source, root, directory);
+    if listing.root.as_os_str().is_empty() {
+        return Browser::default();
+    }
     let mut selected: BTreeSet<_> = selected.into_iter().collect();
     selected.retain(|path| {
         std::fs::symlink_metadata(path)
             .err()
             .is_none_or(|error| error.kind() != io::ErrorKind::NotFound)
     });
-    for directory in directory
-        .ancestors()
-        .take_while(|path| path.starts_with(&root))
-    {
-        if let Ok(entries) = copy::list(&root, directory, true) {
-            return Browser {
-                listing: Listing {
-                    directory: directory.into(),
-                    root,
-                    entries,
-                },
-                selected,
-                selection_size: SelectionSize::Pending,
-            };
-        }
+    Browser {
+        listing,
+        selected,
+        selection_size: SelectionSize::Pending,
     }
-    Browser::default()
 }
 
 unsafe fn collect_task(window: Handle) {
@@ -1195,7 +1525,7 @@ unsafe fn collect_task(window: Handle) {
                     let message = if listing.entries.is_empty() {
                         "La cartella di origine è vuota."
                     } else if readonly_volume(&listing.root)
-                        && linux_move_access(&listing.root).is_none()
+                        && linux_write_access(&listing.root).is_none()
                     {
                         "Origine Linux in sola lettura. Spunta gli elementi da copiare."
                     } else {
@@ -1266,6 +1596,24 @@ unsafe fn collect_task(window: Handle) {
                     wide("Esito del trasferimento").as_ptr(),
                     0x40,
                 );
+            }
+        }
+        Some(Ok(TaskResult::FileChange {
+            result,
+            source,
+            destination,
+        })) => {
+            replace_browser(window, source);
+            DESTINATION_VIEW.with(|view| view.replace(destination));
+            update_view(window, Pane::Destination);
+            ShowWindow(GetDlgItem(window, PROGRESS), 0);
+            match result {
+                Ok(message) => status(window, &message),
+                Err(error) => {
+                    let message = format!("Operazione interrotta. {error}");
+                    status(window, &message);
+                    file_notice(window, "Gestione file · Disk Copy 98", &message);
+                }
             }
         }
         _ => status(window, "Operazione interrotta."),
@@ -1372,8 +1720,15 @@ unsafe fn update_controls(window: Handle) {
     for pane in [Pane::Source, Pane::Destination] {
         let ids = pane.controls();
         let selected = highlighted(window, pane);
-        let (can_open, can_up) =
-            pane.with_listing(|view| (view.selected_folder(selected).is_some(), view.can_go_up()));
+        let (can_open, can_up, can_create, can_change) = pane.with_listing(|view| {
+            let item = selected.and_then(|index| view.entries.get(index));
+            (
+                view.selected_folder(selected).is_some(),
+                view.can_go_up(),
+                view.is_folder() && can_write(&view.directory),
+                item.is_some_and(|entry| can_write(&entry.path)),
+            )
+        });
         for (id, enabled) in [
             (ids.path, true),
             (ids.show, true),
@@ -1382,6 +1737,16 @@ unsafe fn update_controls(window: Handle) {
             (ids.up, can_up),
         ] {
             EnableWindow(GetDlgItem(window, id), i32::from(enabled && !busy));
+        }
+        for (action, _, _) in FILE_ACTIONS {
+            let enabled = match action {
+                FileAction::NewFile | FileAction::NewFolder => can_create,
+                FileAction::Move | FileAction::Delete => can_change,
+            };
+            EnableWindow(
+                GetDlgItem(window, ids.actions + action as i32),
+                i32::from(enabled && !busy),
+            );
         }
     }
     let (count, visible, covered, summary) = UI.with_borrow(|ui| {
@@ -1399,10 +1764,7 @@ unsafe fn update_controls(window: Handle) {
         (CLEAR, count > 0),
         (COPY, true),
         (KEEP_BOTH, true),
-        (
-            MOVE,
-            count > 0 && (!readonly_volume(&source) || linux_move_access(&source).is_some()),
-        ),
+        (MOVE, count > 0 && can_write(&source)),
     ] {
         EnableWindow(GetDlgItem(window, id), i32::from(enabled && !busy));
     }
@@ -1503,6 +1865,9 @@ unsafe fn help(window: Handle) {
             "Azzera spunte deseleziona tutti gli elementi.\r\n\r\n",
             "3. Copia selezione lascia gli originali al loro posto. Sposta selezione li rimuove dopo il trasferimento. ",
             "Senza spunte, Copia tutto copia l'intera origine. La barra mostra l'avanzamento.\r\n\r\n",
+            "4. Nei due pannelli usa Nuovo file o Nuova cartella per creare un elemento nella cartella aperta. ",
+            "Evidenzia una riga per usare Sposta o Elimina. Sposta chiede la cartella di arrivo e mantiene il nome. ",
+            "Elimina chiede conferma e rimuove la cartella con tutto il suo contenuto, saltando il Cestino.\r\n\r\n",
             "Se il nome di un file esiste già, attiva Mantieni entrambi per aggiungere un suffisso in destinazione. ",
             "Il riepilogo indica il motivo dei salti.\r\n\r\n",
             "Esempi di percorso: D:\\Foto, E:\\Backup, \\\\wsl.localhost\\Ubuntu\\home\\utente",
@@ -1601,6 +1966,16 @@ unsafe extern "system" fn procedure(
                     (CLEAR, 0) => bulk_selection(window, false),
                     (COPY, 0) => start_transfer(window, Operation::Copy),
                     (MOVE, 0) => start_transfer(window, Operation::Move),
+                    (SOURCE_ACTIONS..=129, 0) => manage_files(
+                        window,
+                        Pane::Source,
+                        FILE_ACTIONS[(id - SOURCE_ACTIONS) as usize].0,
+                    ),
+                    (DESTINATION_ACTIONS..=133, 0) => manage_files(
+                        window,
+                        Pane::Destination,
+                        FILE_ACTIONS[(id - DESTINATION_ACTIONS) as usize].0,
+                    ),
                     _ => {}
                 }
             }
@@ -1614,7 +1989,7 @@ unsafe extern "system" fn procedure(
         0x113 if wparam == JOB_TIMER => collect_task(window),
         0x113 if wparam == SELECTION_SIZE_TIMER => poll_selection_size(window),
         0x113 if wparam == DEVICE_TIMER => {
-            if !busy() {
+            if !busy() && !FILE_PROMPT_OPEN.get() {
                 KillTimer(window, DEVICE_TIMER);
                 scan_drives(window, field(window, SOURCE).as_os_str().is_empty());
             }

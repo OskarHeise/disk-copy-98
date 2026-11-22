@@ -1,7 +1,7 @@
 use crate::disks::{self, Disk};
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf, Prefix},
     process::{Child, Output, Stdio},
 };
 
@@ -66,23 +66,58 @@ pub struct Volume {
     pub path: PathBuf,
     pub label: String,
     pub readonly: bool,
-    pub move_access: Option<MoveAccess>,
+    pub write_access: Option<WriteAccess>,
 }
 
-#[derive(Clone)]
-pub struct MoveAccess {
+impl Volume {
+    pub fn contains(&self, path: &Path) -> bool {
+        fn wsl_parts(path: &Path) -> Option<(&std::ffi::OsStr, PathBuf)> {
+            let mut components = path.components();
+            let Component::Prefix(prefix) = components.next()? else {
+                return None;
+            };
+            let (host, distro) = match prefix.kind() {
+                Prefix::UNC(host, distro) | Prefix::VerbatimUNC(host, distro) => (host, distro),
+                _ => return None,
+            };
+            if !host.eq_ignore_ascii_case("wsl.localhost") && !host.eq_ignore_ascii_case("wsl$") {
+                return None;
+            }
+            let mut relative = PathBuf::new();
+            for component in components {
+                match component {
+                    Component::Normal(name) => relative.push(name),
+                    Component::ParentDir => {
+                        relative.pop();
+                    }
+                    _ => {}
+                }
+            }
+            Some((distro, relative))
+        }
+        match (wsl_parts(&self.path), wsl_parts(path)) {
+            (Some((distro, volume)), Some((host_distro, item))) => {
+                distro.eq_ignore_ascii_case(host_distro) && item.starts_with(volume)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct WriteAccess {
     distro: String,
     mountpoint: String,
 }
 
-impl MoveAccess {
-    pub fn run<T>(&self, transfer: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+impl WriteAccess {
+    pub fn run<T>(&self, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         checked(
-            linux(&self.distro, &["begin-move", &self.mountpoint])?,
+            linux(&self.distro, &["begin-write", &self.mountpoint])?,
             "Impossibile aprire il volume in scrittura.",
         )?;
-        let result = transfer();
-        let close = linux(&self.distro, &["end-move", &self.mountpoint]).and_then(|output| {
+        let result = operation();
+        let close = linux(&self.distro, &["end-write", &self.mountpoint]).and_then(|output| {
             checked(
                 output,
                 "Impossibile chiudere la sessione di scrittura. Usa Espelli WSL.",
@@ -414,7 +449,7 @@ exit $LASTEXITCODE"#,
                 continue;
             }
             self.folder = Some(base.to_owned());
-            let move_access = (*mode == "move").then(|| MoveAccess {
+            let write_access = (*mode == "move").then(|| WriteAccess {
                 distro: self.distro.clone(),
                 mountpoint: (*path).to_owned(),
             });
@@ -430,8 +465,8 @@ exit $LASTEXITCODE"#,
                     "{} · {} ({filesystem}{})",
                     self.label,
                     device,
-                    if move_access.is_some() {
-                        ", copia e spostamento"
+                    if write_access.is_some() {
+                        ", scrittura su richiesta"
                     } else if readonly {
                         ", sola lettura"
                     } else {
@@ -439,7 +474,7 @@ exit $LASTEXITCODE"#,
                     }
                 ),
                 readonly,
-                move_access,
+                write_access,
             });
         }
         if self.volumes.is_empty() {

@@ -95,7 +95,7 @@ clean_ext() {
         ! printf '%s\n' "$header" | grep -Eq '^Filesystem features:.*[[:space:]]needs_recovery([[:space:]]|$)'
 }
 
-switch_move_mount() (
+switch_write_mount() (
     action="$1"
     dir="$2"
     base=$(dirname "$dir")
@@ -106,7 +106,7 @@ switch_move_mount() (
     write_record="$loop_record-write"
     mounted=$(findmnt -n -o SOURCE --mountpoint "$dir")
 
-    if [ "$action" = begin-move ]; then
+    if [ "$action" = begin-write ]; then
         [ "$mounted" = "$original" ] && [ ! -e "$write_record" ] || exit 1
         if ! clean_ext "$original"; then
             echo 'Il filesystem richiede un controllo. Il volume resta in sola lettura.' >&2
@@ -246,8 +246,8 @@ case "$1" in
     unmount)
         unmount_volumes "$2"
         ;;
-    begin-move|end-move)
-        switch_move_mount "$1" "$2"
+    begin-write|end-write)
+        switch_write_mount "$1" "$2"
         ;;
     mount)
         disk=''
