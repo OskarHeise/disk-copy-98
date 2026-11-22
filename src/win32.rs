@@ -132,6 +132,8 @@ extern "system" {
         param: Handle,
     ) -> Handle;
     pub fn DefWindowProcW(window: Handle, message: u32, wparam: usize, lparam: isize) -> isize;
+    pub fn DestroyWindow(window: Handle) -> i32;
+    pub fn ShowWindow(window: Handle, command: i32) -> i32;
     pub fn LoadCursorW(instance: Handle, name: *const u16) -> Handle;
     pub fn LoadIconW(instance: Handle, name: *const u16) -> Handle;
     pub fn GetMessageW(message: *mut Message, window: Handle, min: u32, max: u32) -> i32;
@@ -218,6 +220,9 @@ extern "system" {
 }
 
 pub const WM_SETFONT: u32 = 0x0030;
+pub const BM_GETCHECK: u32 = 0x00f0;
+pub const PBM_SETPOS: u32 = 0x0402;
+pub const PBM_SETBARCOLOR: u32 = 0x0409;
 pub const CB_ADDSTRING: u32 = 0x0143;
 pub const CB_GETCURSEL: u32 = 0x0147;
 pub const CB_RESETCONTENT: u32 = 0x014b;

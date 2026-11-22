@@ -2,6 +2,7 @@
 
 mod copy;
 mod disks;
+mod linux;
 mod theme;
 mod win32;
 
@@ -14,7 +15,10 @@ use std::{
     os::windows::ffi::{OsStrExt, OsStringExt},
     path::{Path, PathBuf},
     ptr::{null, null_mut},
-    sync::mpsc::{self, Receiver, TryRecvError},
+    sync::{
+        mpsc::{self, Receiver, TryRecvError},
+        Arc, Mutex,
+    },
 };
 use theme::{Theme, FILES_TOP, FOOTER_HEIGHT, MARGIN};
 use win32::*;
@@ -36,6 +40,9 @@ const STATUS: i32 = 114;
 const SELECTION: i32 = 115;
 const SOURCE_LABEL: i32 = 116;
 const DESTINATION_LABEL: i32 = 117;
+const EJECT: i32 = 118;
+const PROGRESS: i32 = 119;
+const KEEP_BOTH: i32 = 120;
 const APP_ICON_RESOURCE: u16 = 101;
 const MIN_WIDTH: i32 = 700;
 const MIN_HEIGHT: i32 = 600;
@@ -85,22 +92,37 @@ impl Listing {
 enum TaskResult {
     Browse(io::Result<Listing>),
     Drives {
-        result: io::Result<Vec<disks::Disk>>,
+        result: io::Result<disks::Inventory>,
         choose: bool,
+    },
+    Mount {
+        result: io::Result<linux::MountedDisk>,
+        field: i32,
+    },
+    Eject {
+        remaining: Vec<linux::MountedDisk>,
+        error: Option<String>,
+        exit: bool,
     },
     Transfer {
         message: String,
+        details: Option<String>,
+        finished: bool,
         refreshed: Option<Browser>,
     },
 }
+
+type TransferProgress = Arc<Mutex<Option<copy::Progress>>>;
 
 thread_local! {
     static UI: RefCell<Browser> = RefCell::new(Browser::default());
     static THEME: RefCell<Option<Theme>> = const { RefCell::new(None) };
     static JOB: RefCell<Option<Receiver<TaskResult>>> = const { RefCell::new(None) };
+    static ACTIVE_PROGRESS: RefCell<Option<(Operation, TransferProgress)>> = const { RefCell::new(None) };
     static REDRAW_LIST: Cell<bool> = const { Cell::new(false) };
     static SETTING_PATHS: Cell<bool> = const { Cell::new(false) };
     static DISKS_WITHOUT_DRIVE_LETTERS: RefCell<Vec<disks::Disk>> = const { RefCell::new(Vec::new()) };
+    static MOUNTED_DISKS: RefCell<Vec<linux::MountedDisk>> = const { RefCell::new(Vec::new()) };
 }
 
 unsafe fn window_text(control: Handle) -> Vec<u16> {
@@ -168,6 +190,7 @@ unsafe fn setup(window: Handle) {
     );
     control(window, "COMBOBOX", "", DESTINATION, DROPDOWN, 0);
     control(window, "BUTTON", "&Mostra file", SHOW, BUTTON, 0);
+    control(window, "BUTTON", "Espelli WSL", EJECT, BUTTON, 0);
     control(window, "BUTTON", "Apri", OPEN, BUTTON, 0);
     control(window, "BUTTON", "Su", UP, BUTTON, 0);
     control(window, "BUTTON", "Spunta tutti", SELECT_ALL, BUTTON, 0);
@@ -208,6 +231,22 @@ unsafe fn setup(window: Handle) {
     control(window, "BUTTON", "&Sposta selezione", MOVE, BUTTON, 0);
     control(
         window,
+        "BUTTON",
+        "&Mantieni entrambi se il nome esiste già",
+        KEEP_BOTH,
+        TAB | 3,
+        0,
+    );
+    let progress = control(window, "msctls_progress32", "", PROGRESS, 1, 0);
+    SendMessageW(
+        progress,
+        PBM_SETBARCOLOR,
+        0,
+        theme::rgb(38, 119, 184) as isize,
+    );
+    ShowWindow(progress, 0);
+    control(
+        window,
         "STATIC",
         "Scegli una cartella o un'unità di origine.",
         STATUS,
@@ -234,6 +273,7 @@ unsafe fn layout(window: Handle) {
     place(AUTO, width - 147, 165, 118, 29);
     place(DESTINATION_LABEL, 30, 201, 90, 25);
     place(DESTINATION, 123, 201, width - 152, 190);
+    place(EJECT, 30, FILES_TOP + 8, 113, 29);
     place(SHOW, 151, FILES_TOP + 8, 109, 29);
     place(OPEN, 268, FILES_TOP + 8, 66, 29);
     place(UP, 342, FILES_TOP + 8, 51, 29);
@@ -256,10 +296,12 @@ unsafe fn layout(window: Handle) {
     place(SELECTION, 30, footer - 31, width - 60, 18);
     place(MOVE, width - 174, footer + 11, 156, 33);
     place(COPY, width - 334, footer + 11, 151, 33);
+    place(KEEP_BOTH, MARGIN + 2, footer + 11, width - 365, 33);
+    place(PROGRESS, MARGIN, footer + 50, width - 2 * MARGIN, 15);
     place(
         STATUS,
         MARGIN + 22,
-        footer + 59,
+        footer + 78,
         width - MARGIN * 2 - 32,
         35,
     );
@@ -271,39 +313,86 @@ unsafe fn scan_drives(window: Handle, choose: bool) {
         window,
         choose.then_some("Rilevamento dei dischi in corso…"),
         move || TaskResult::Drives {
-            result: disks::without_drive_letters(),
+            result: disks::scan(),
             choose,
         },
     );
 }
 
-fn disk_notice(source: &Path) -> Option<String> {
+fn physical_disk(path: &Path) -> Option<disks::Disk> {
     DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(|disks| {
         disks
             .iter()
-            .find(|disk| source.as_os_str() == OsStr::new(&disk.label))
-            .map(|disk| disk.notice.clone())
+            .find(|disk| path.as_os_str() == OsStr::new(&disk.label))
+            .cloned()
     })
 }
 
-unsafe fn selected_disk_notice(combo: Handle) -> Option<String> {
+unsafe fn selected_disk_item(combo: Handle) -> Option<usize> {
     let selection = SendMessageW(combo, CB_GETCURSEL, 0, 0);
     let data = SendMessageW(combo, CB_GETITEMDATA, usize::try_from(selection).ok()?, 0);
-    let index = usize::try_from(data).ok()?.checked_sub(1)?;
-    DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(|disks| disks.get(index).map(|disk| disk.notice.clone()))
+    usize::try_from(data).ok().filter(|&index| index > 0)
 }
 
-unsafe fn refresh_drives(
-    window: Handle,
-    choose: bool,
-    result: io::Result<Vec<disks::Disk>>,
-) {
+unsafe fn add_disk_item(combo: Handle, label: &str, data: usize) {
+    let item = SendMessageW(combo, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+    if item >= 0 {
+        SendMessageW(combo, CB_SETITEMDATA, item as usize, data as isize);
+    }
+}
+
+unsafe fn add_volumes(window: Handle, first: usize) {
+    let physical = DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(Vec::len);
+    MOUNTED_DISKS.with_borrow(|disks| {
+        for (index, volume) in disks
+            .iter()
+            .flat_map(|disk| &disk.volumes)
+            .enumerate()
+            .skip(first)
+        {
+            add_disk_item(
+                GetDlgItem(window, SOURCE),
+                &volume.label,
+                physical + index + 1,
+            );
+            if !volume.readonly {
+                add_disk_item(
+                    GetDlgItem(window, DESTINATION),
+                    &volume.label,
+                    physical + index + 1,
+                );
+            }
+        }
+    });
+}
+
+unsafe fn set_path(window: Handle, id: i32, path: &Path) {
+    SETTING_PATHS.set(true);
+    let value: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    SetWindowTextW(GetDlgItem(window, id), value.as_ptr());
+    SETTING_PATHS.set(false);
+    if id == SOURCE {
+        UI.with(|ui| ui.replace(Browser::default()));
+        update_view(window);
+    }
+}
+
+unsafe fn refresh_drives(window: Handle, choose: bool, result: io::Result<disks::Inventory>) {
     let source = field(window, SOURCE);
     let destination = field(window, DESTINATION);
     let failed = result.is_err();
-    let disks = result.unwrap_or_default();
-    let removed = disk_notice(&source).is_some()
-        && !disks.iter().any(|disk| source.as_os_str() == OsStr::new(&disk.label));
+    let disks::Inventory {
+        without_drive_letters: disks,
+        usb_drive_letters,
+    } = result.unwrap_or_else(|_| disks::Inventory {
+        without_drive_letters: DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(Clone::clone),
+        usb_drive_letters: String::new(),
+    });
+    let removed = !failed
+        && physical_disk(&source).is_some()
+        && !disks
+            .iter()
+            .any(|disk| source.as_os_str() == OsStr::new(&disk.label));
     let mut drives = Vec::new();
     let mask = GetLogicalDrives();
     let system = std::env::var("SystemDrive").unwrap_or_else(|_| String::from("C:"));
@@ -314,7 +403,8 @@ unsafe fn refresh_drives(
             drives.push((root, kind));
         }
     }
-    let mut automatic = if choose {
+    let external = |drive: &str, kind| kind == 2 || usb_drive_letters.contains(&drive[..1]);
+    let mounted = if choose {
         let destination_drive = destination.to_string_lossy();
         let mut candidates: Vec<_> = drives
             .iter()
@@ -322,30 +412,43 @@ unsafe fn refresh_drives(
             .collect();
         candidates.sort_by_key(|(drive, kind)| {
             (
+                !external(drive, *kind),
                 *kind,
                 drive.trim_end_matches('\\').eq_ignore_ascii_case(&system),
             )
         });
-        candidates
-            .into_iter()
-            .map(|(drive, _)| drive)
-            .find(|drive| {
-                !destination_drive
-                    .get(..2)
-                    .is_some_and(|prefix| drive[..2].eq_ignore_ascii_case(prefix))
-                    && std::fs::metadata(drive).is_ok_and(|metadata| metadata.is_dir())
-            })
-            .map(String::as_str)
+        candidates.into_iter().find(|(drive, _)| {
+            !destination_drive
+                .get(..2)
+                .is_some_and(|prefix| drive[..2].eq_ignore_ascii_case(prefix))
+                && std::fs::metadata(drive).is_ok_and(|metadata| metadata.is_dir())
+        })
     } else {
         None
     };
-    if choose && automatic.is_none_or(|drive| drive.trim_end_matches('\\').eq_ignore_ascii_case(&system)) {
-        if let Some(disk) = disks.iter().find(|disk| disk.usb) {
-            automatic = Some(&disk.label);
-        }
-    }
+    let detected_usb = if choose && mounted.is_none_or(|(drive, kind)| !external(drive, *kind)) {
+        disks.iter().find(|disk| disk.usb && disk.mountable)
+    } else {
+        None
+    };
+    let linux_path = MOUNTED_DISKS.with_borrow(|disks| {
+        disks
+            .iter()
+            .flat_map(|disk| &disk.volumes)
+            .find(|volume| !destination.starts_with(&volume.path))
+            .map(|volume| volume.path.clone())
+    });
+    let automatic = detected_usb
+        .map(|disk| PathBuf::from(&disk.label))
+        .or_else(|| {
+            mounted
+                .filter(|(drive, kind)| external(drive, *kind))
+                .map(|(drive, _)| PathBuf::from(drive))
+        })
+        .or_else(|| choose.then_some(linux_path).flatten())
+        .or_else(|| mounted.map(|(drive, _)| PathBuf::from(drive)));
     let new_source = match automatic {
-        Some(drive) => PathBuf::from(drive),
+        Some(ref drive) => drive.clone(),
         None if removed => PathBuf::new(),
         None => source.clone(),
     };
@@ -356,28 +459,28 @@ unsafe fn refresh_drives(
         for (drive, _) in &drives {
             SendMessageW(combo, CB_ADDSTRING, 0, wide(drive).as_ptr() as isize);
         }
-        if id == SOURCE {
-            for (index, disk) in disks.iter().enumerate() {
-                let item = SendMessageW(combo, CB_ADDSTRING, 0, wide(&disk.label).as_ptr() as isize);
-                if item >= 0 {
-                    SendMessageW(combo, CB_SETITEMDATA, item as usize, (index + 1) as isize);
-                }
+        for (index, disk) in disks.iter().enumerate() {
+            if id == SOURCE || disk.mountable {
+                add_disk_item(combo, &disk.label, index + 1);
             }
         }
         let value: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
         SetWindowTextW(combo, value.as_ptr());
     }
-    SETTING_PATHS.set(false);
     let automatic = automatic.is_some();
     DISKS_WITHOUT_DRIVE_LETTERS.with(|items| items.replace(disks));
+    add_volumes(window, 0);
+    SETTING_PATHS.set(false);
     if source != new_source {
         UI.with(|ui| ui.replace(Browser::default()));
         update_view(window);
     }
     if failed && (choose || removed) {
         status(window, "Inventario dei dischi fisici non disponibile. Puoi usare le unità con lettera o digitare un percorso.");
-    } else if let Some(notice) = disk_notice(&new_source) {
-        status(window, &notice);
+    } else if let Some(disk) = physical_disk(&new_source) {
+        if choose || source != new_source {
+            status(window, &disk.notice);
+        }
     } else if automatic {
         status(
             window,
@@ -387,7 +490,10 @@ unsafe fn refresh_drives(
             ),
         );
     } else if removed {
-        status(window, "Il disco di origine è cambiato. Scegli di nuovo l'origine.");
+        status(
+            window,
+            "Il disco di origine è cambiato. Scegli di nuovo l'origine.",
+        );
     } else if choose {
         status(
             window,
@@ -432,8 +538,8 @@ unsafe fn launch(
 
 unsafe fn show_files(window: Handle) {
     let root = field(window, SOURCE);
-    if let Some(notice) = disk_notice(&root) {
-        status(window, &notice);
+    if let Some(disk) = physical_disk(&root) {
+        mount_disk(window, SOURCE, disk);
         return;
     }
     if !root.is_absolute() {
@@ -451,6 +557,71 @@ unsafe fn show_files(window: Handle) {
         }
     });
     browse(window, root, directory);
+}
+
+unsafe fn mount_disk(window: Handle, field: i32, disk: disks::Disk) {
+    if !disk.mountable {
+        status(window, &disk.notice);
+        return;
+    }
+    launch(
+        window,
+        Some("Collegamento del disco a WSL. Conferma eventuali richieste di Windows…"),
+        move || TaskResult::Mount {
+            result: linux::MountedDisk::open(disk),
+            field,
+        },
+    );
+}
+
+unsafe fn choose_disk_item(window: Handle, id: i32, combo: Handle) {
+    let Some(item) = selected_disk_item(combo) else {
+        return;
+    };
+    let physical = DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(Vec::len);
+    if item <= physical {
+        let disk = DISKS_WITHOUT_DRIVE_LETTERS.with_borrow(|disks| disks[item - 1].clone());
+        mount_disk(window, id, disk);
+    } else {
+        let path = MOUNTED_DISKS.with_borrow(|disks| {
+            disks
+                .iter()
+                .flat_map(|disk| &disk.volumes)
+                .nth(item - physical - 1)
+                .map(|volume| volume.path.clone())
+        });
+        if let Some(path) = path {
+            set_path(window, id, &path);
+            if id == SOURCE {
+                browse(window, path.clone(), path);
+            } else {
+                status(window, "Volume Linux impostato come destinazione.");
+            }
+        }
+    }
+}
+
+unsafe fn eject_linux(window: Handle, exit: bool) {
+    let disks = MOUNTED_DISKS.with(|disks| disks.take());
+    launch(
+        window,
+        Some("Smontaggio sicuro dei dischi Linux in corso…"),
+        move || {
+            let mut remaining = Vec::new();
+            let mut error = None;
+            for mut disk in disks {
+                if let Err(problem) = disk.close() {
+                    error = Some(format!("{} · {problem}", disk.label));
+                    remaining.push(disk);
+                }
+            }
+            TaskResult::Eject {
+                remaining,
+                error,
+                exit,
+            }
+        },
+    );
 }
 
 unsafe fn browse(window: Handle, root: PathBuf, directory: PathBuf) {
@@ -489,11 +660,26 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
         return;
     }
     let source = field(window, SOURCE);
-    if let Some(notice) = disk_notice(&source) {
-        status(window, &notice);
+    if let Some(disk) = physical_disk(&source) {
+        mount_disk(window, SOURCE, disk);
         return;
     }
     let destination = field(window, DESTINATION);
+    if let Some(disk) = physical_disk(&destination) {
+        mount_disk(window, DESTINATION, disk);
+        return;
+    }
+    let moving = operation == Operation::Move;
+    let move_access = moving.then(|| linux_move_access(&source)).flatten();
+    if readonly_volume(&destination)
+        || (moving && move_access.is_none() && readonly_volume(&source))
+    {
+        status(
+            window,
+            "Il volume Linux è in sola lettura. Puoi usarlo come origine per una copia.",
+        );
+        return;
+    }
     if !source.is_absolute() || !destination.is_absolute() {
         status(
             window,
@@ -511,7 +697,6 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
             (source.clone(), Vec::new())
         }
     });
-    let moving = operation == Operation::Move;
     if moving {
         if selected.is_empty() {
             return;
@@ -530,39 +715,110 @@ unsafe fn start_transfer(window: Handle, operation: Operation) {
             return;
         }
     }
-    let progress = if moving {
-        "Spostamento in corso…"
-    } else {
-        "Copia in corso…"
-    };
-    launch(window, Some(progress), move || {
-        let result = if selected.is_empty() {
-            copy::copy(&source, &destination)
+    let keep_both = SendMessageW(GetDlgItem(window, KEEP_BOTH), BM_GETCHECK, 0, 0) == 1;
+    let progress: TransferProgress = Arc::new(Mutex::new(None));
+    let worker_progress = Arc::clone(&progress);
+    launch(
+        window,
+        Some(if moving {
+            "Preparazione dello spostamento…"
         } else {
-            copy::transfer_selection(&source, &destination, &selected, operation)
-        };
-        let message = match result {
-            Ok(report) => format!(
-                "{} completata. {} file ({} byte), {} {}. {} saltati.",
-                if moving { "Operazione" } else { "Copia" },
-                report.files,
-                report.bytes,
-                report.folders,
-                if report.folders == 1 {
-                    "cartella"
-                } else {
-                    "cartelle"
-                },
-                report.skipped,
-            ),
-            Err(error) => format!(
-                "{} interrotta. {error}",
-                if moving { "Operazione" } else { "Copia" }
-            ),
-        };
-        let refreshed = moving.then(|| refresh_after_move(source, directory, selected));
-        TaskResult::Transfer { message, refreshed }
-    });
+            "Preparazione della copia…"
+        }),
+        move || {
+            let transfer = || {
+                copy::transfer(
+                    &source,
+                    &destination,
+                    &selected,
+                    operation,
+                    keep_both,
+                    &mut |update| *worker_progress.lock().unwrap() = Some(update),
+                )
+            };
+            let result = match move_access {
+                Some(access) => access.run(transfer),
+                None => transfer(),
+            };
+            let finished = result.is_ok();
+            let (message, details) = match result {
+                Ok(report) => {
+                    let mut message = format!(
+                        "{} file {} · {} · {} cartelle · {} saltati.",
+                        report.files,
+                        if moving { "spostati" } else { "copiati" },
+                        display_bytes(report.bytes),
+                        report.folders,
+                        report.skipped,
+                    );
+                    if report.renamed > 0 {
+                        message.push_str(&format!(" {} rinominati.", report.renamed));
+                    }
+                    let details = (report.skipped > 0).then(|| {
+                        let mut details =
+                            format!("{message}\r\n\r\n{}", report.skip_details.join("\r\n\r\n"));
+                        if report.skipped > report.skip_details.len() as u64 {
+                            details.push_str(&format!(
+                                "\r\n\r\nAltri elementi saltati: {}.",
+                                report.skipped - report.skip_details.len() as u64
+                            ));
+                        }
+                        details
+                    });
+                    (message, details)
+                }
+                Err(error) => {
+                    let message = format!(
+                        "{} interrotta. {error}",
+                        if moving { "Operazione" } else { "Copia" }
+                    );
+                    (message.clone(), Some(message))
+                }
+            };
+            let refreshed = moving.then(|| refresh_after_move(source, directory, selected));
+            TaskResult::Transfer {
+                message,
+                details,
+                finished,
+                refreshed,
+            }
+        },
+    );
+    if busy() {
+        ACTIVE_PROGRESS.with(|active| active.replace(Some((operation, progress))));
+        let bar = GetDlgItem(window, PROGRESS);
+        SendMessageW(bar, PBM_SETPOS, 0, 0);
+        ShowWindow(bar, 5);
+    }
+}
+
+fn display_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+    match bytes {
+        bytes if bytes >= GIB => format!("{:.1} GiB", bytes as f64 / GIB as f64),
+        bytes if bytes >= MIB => format!("{:.1} MiB", bytes as f64 / MIB as f64),
+        bytes => format!("{bytes} byte"),
+    }
+}
+
+fn readonly_volume(path: &Path) -> bool {
+    MOUNTED_DISKS.with_borrow(|disks| {
+        disks
+            .iter()
+            .flat_map(|disk| &disk.volumes)
+            .any(|volume| volume.readonly && path.starts_with(&volume.path))
+    })
+}
+
+fn linux_move_access(path: &Path) -> Option<linux::MoveAccess> {
+    MOUNTED_DISKS.with_borrow(|disks| {
+        disks
+            .iter()
+            .flat_map(|disk| &disk.volumes)
+            .find(|volume| path.starts_with(&volume.path))
+            .and_then(|volume| volume.move_access.clone())
+    })
 }
 
 fn refresh_after_move(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>) -> Browser {
@@ -589,19 +845,121 @@ fn refresh_after_move(root: PathBuf, directory: PathBuf, selected: Vec<PathBuf>)
 }
 
 unsafe fn collect_task(window: Handle) {
+    let progress = ACTIVE_PROGRESS.with_borrow(|active| {
+        let (operation, latest) = active.as_ref()?;
+        Some((*operation, latest.lock().unwrap().take()?))
+    });
+    if let Some((operation, progress)) = progress {
+        let percent = (u128::from(progress.processed) * 100 / u128::from(progress.total.max(1)))
+            .min(99) as usize;
+        SendMessageW(GetDlgItem(window, PROGRESS), PBM_SETPOS, percent, 0);
+        status(
+            window,
+            &format!(
+                "{} · {percent}% · {} scritti",
+                if operation == Operation::Move {
+                    "Spostamento"
+                } else {
+                    "Copia"
+                },
+                display_bytes(progress.written)
+            ),
+        );
+    }
     let result = JOB.with_borrow(|job| job.as_ref().map(Receiver::try_recv));
     match result {
         Some(Err(TryRecvError::Empty)) | None => return,
         _ => {}
     }
     JOB.with(|job| job.replace(None));
+    ACTIVE_PROGRESS.with(|active| active.replace(None));
     KillTimer(window, JOB_TIMER);
     match result {
         Some(Ok(TaskResult::Drives { result, choose })) => {
             refresh_drives(window, choose, result);
         }
+        Some(Ok(TaskResult::Mount {
+            result: Ok(disk),
+            field,
+        })) => {
+            let mut choices = disk
+                .volumes
+                .iter()
+                .filter(|volume| field == SOURCE || !volume.readonly);
+            let path = choices.next().map(|volume| volume.path.clone());
+            let multiple = choices.next().is_some();
+            let first = MOUNTED_DISKS
+                .with_borrow(|disks| disks.iter().map(|disk| disk.volumes.len()).sum());
+            MOUNTED_DISKS.with_borrow_mut(|disks| disks.push(disk));
+            add_volumes(window, first);
+            if multiple {
+                set_path(window, field, Path::new(""));
+                status(window, "Disco aperto in WSL. Scegli il volume dal menu.");
+            } else if let Some(path) = path {
+                set_path(window, field, &path);
+                if field == SOURCE {
+                    browse(window, path.clone(), path);
+                } else {
+                    status(
+                        window,
+                        "Volume Linux impostato. Premi Copia o Sposta per trasferire i file.",
+                    );
+                }
+            } else {
+                set_path(window, field, Path::new(""));
+                status(
+                    window,
+                    "I volumi del disco sono in sola lettura. Puoi sceglierli dal menu Origine.",
+                );
+            }
+        }
+        Some(Ok(TaskResult::Mount {
+            result: Err(error), ..
+        })) => {
+            let message = error.to_string();
+            status(window, &message);
+            MessageBoxW(
+                window,
+                wide(&message).as_ptr(),
+                wide("Disco Linux · Disk Copy 98").as_ptr(),
+                0x30,
+            );
+        }
+        Some(Ok(TaskResult::Eject {
+            remaining,
+            error,
+            exit,
+        })) => {
+            MOUNTED_DISKS.with(|disks| disks.replace(remaining));
+            for id in [SOURCE, DESTINATION] {
+                if field(window, id)
+                    .to_string_lossy()
+                    .contains(r"\mnt\wsl\disk-copy-98.")
+                {
+                    set_path(window, id, Path::new(""));
+                }
+            }
+            if let Some(error) = error {
+                status(window, &error);
+                MessageBoxW(
+                    window,
+                    wide(&error).as_ptr(),
+                    wide("Smontaggio · Disk Copy 98").as_ptr(),
+                    0x30,
+                );
+                scan_drives(window, false);
+            } else if exit {
+                DestroyWindow(window);
+                return;
+            } else {
+                status(window, "Dischi Linux smontati.");
+                scan_drives(window, false);
+            }
+        }
         Some(Ok(TaskResult::Browse(Ok(listing)))) => {
             let count = listing.entries.len();
+            let readonly = readonly_volume(&listing.root);
+            let can_move = linux_move_access(&listing.root).is_some();
             UI.with_borrow_mut(|ui| {
                 if ui.root != listing.root {
                     ui.selected.clear();
@@ -619,6 +977,10 @@ unsafe fn collect_task(window: Handle) {
                 window,
                 if count == 0 {
                     "La cartella è vuota."
+                } else if can_move {
+                    "Spunta i file e scegli Copia selezione o Sposta selezione."
+                } else if readonly {
+                    "Volume Linux in sola lettura. Spunta i file o le cartelle da copiare."
                 } else {
                     "Spunta i file o le cartelle da trasferire. Apri le cartelle con un doppio clic."
                 },
@@ -627,12 +989,28 @@ unsafe fn collect_task(window: Handle) {
         Some(Ok(TaskResult::Browse(Err(error)))) => {
             status(window, &format!("Impossibile aprire il percorso. {error}"))
         }
-        Some(Ok(TaskResult::Transfer { message, refreshed })) => {
+        Some(Ok(TaskResult::Transfer {
+            message,
+            details,
+            finished,
+            refreshed,
+        })) => {
             if let Some(browser) = refreshed {
                 UI.with(|ui| ui.replace(browser));
                 update_view(window);
             }
             status(window, &message);
+            if finished {
+                SendMessageW(GetDlgItem(window, PROGRESS), PBM_SETPOS, 100, 0);
+            }
+            if let Some(details) = details {
+                MessageBoxW(
+                    window,
+                    wide(&details).as_ptr(),
+                    wide("Esito del trasferimento").as_ptr(),
+                    0x40,
+                );
+            }
         }
         _ => status(window, "Operazione interrotta."),
     }
@@ -723,6 +1101,7 @@ unsafe fn update_checks(window: Handle) {
 
 unsafe fn update_controls(window: Handle) {
     let busy = busy();
+    let source = field(window, SOURCE);
     let highlighted = highlighted(window);
     let (count, visible, can_open, can_up, covered) = UI.with_borrow(|ui| {
         (
@@ -740,13 +1119,18 @@ unsafe fn update_controls(window: Handle) {
         (DESTINATION, true),
         (AUTO, true),
         (SHOW, true),
+        (EJECT, MOUNTED_DISKS.with_borrow(|disks| !disks.is_empty())),
         (FILES, true),
         (OPEN, can_open),
         (UP, can_up),
         (SELECT_ALL, visible > 0 && !covered),
         (CLEAR, count > 0),
         (COPY, true),
-        (MOVE, count > 0),
+        (KEEP_BOTH, true),
+        (
+            MOVE,
+            count > 0 && (!readonly_volume(&source) || linux_move_access(&source).is_some()),
+        ),
     ] {
         EnableWindow(GetDlgItem(window, id), i32::from(enabled && !busy));
     }
@@ -830,13 +1214,16 @@ unsafe fn help(window: Handle) {
         window,
         wide(concat!(
             "1. Scegli origine e destinazione dai menu oppure digita i percorsi. ",
-            "Auto disco preferisce le unità rimovibili e lascia per ultima quella di sistema. ",
-            "Il menu Origine mostra anche i dischi senza lettera e il loro stato.\r\n\r\n",
+            "Auto disco dà priorità alle unità USB e rimovibili. ",
+            "Scegli un disco senza lettera per montarlo tramite WSL. ",
+            "Se lo ha trovato Auto disco, premi Mostra file. Usa Espelli WSL prima di scollegarlo.\r\n\r\n",
             "2. Premi Mostra file. Apri una cartella con un doppio clic o con Apri. Usa Su per risalire. ",
             "Le spunte restano attive quando cambi cartella. Spuntare una cartella include tutto il suo contenuto. ",
             "Azzera spunte deseleziona tutti gli elementi.\r\n\r\n",
-            "3. Usa Copia selezione o Sposta selezione. Senza spunte, Copia tutto copia l'intera origine. ",
-            "Le sottocartelle mantengono la struttura originale e i file già presenti vengono saltati.\r\n\r\n",
+            "3. Copia selezione lascia gli originali al loro posto. Sposta selezione li rimuove dopo il trasferimento. ",
+            "Senza spunte, Copia tutto copia l'intera origine. La barra mostra l'avanzamento.\r\n\r\n",
+            "Se il nome di un file esiste già, attiva Mantieni entrambi per aggiungere un suffisso in destinazione. ",
+            "Il riepilogo indica il motivo dei salti.\r\n\r\n",
             "Esempi di percorso: D:\\Foto, E:\\Backup, \\\\wsl.localhost\\Ubuntu\\home\\utente",
         )).as_ptr(),
         wide("Guida · Disk Copy 98").as_ptr(),
@@ -900,17 +1287,20 @@ unsafe extern "system" fn procedure(
                     (SOURCE, 1 | 5) if !SETTING_PATHS.get() => {
                         UI.with(|ui| ui.replace(Browser::default()));
                         update_view(window);
-                        let notice = if code == 1 {
-                            selected_disk_notice(lparam as Handle)
-                        } else {
-                            disk_notice(&field(window, SOURCE))
-                        };
-                        status(window, notice.as_deref().unwrap_or(
-                            "Origine aggiornata. Premi Mostra file per sfogliare.",
-                        ));
+                        let notice = physical_disk(&field(window, SOURCE)).map(|disk| disk.notice);
+                        status(
+                            window,
+                            notice
+                                .as_deref()
+                                .unwrap_or("Origine aggiornata. Premi Mostra file per sfogliare."),
+                        );
+                    }
+                    (SOURCE | DESTINATION, 9) if !SETTING_PATHS.get() => {
+                        choose_disk_item(window, id, lparam as Handle);
                     }
                     (AUTO, 0) => scan_drives(window, true),
                     (SHOW, 0) => show_files(window),
+                    (EJECT, 0) => eject_linux(window, false),
                     (OPEN, 0) => navigate(window, false),
                     (UP, 0) => navigate(window, true),
                     (SELECT_ALL, 0) => bulk_selection(window, true),
@@ -931,7 +1321,12 @@ unsafe extern "system" fn procedure(
                 scan_drives(window, field(window, SOURCE).as_os_str().is_empty());
             }
         }
-        0x219 if wparam == 7 || (matches!(wparam, 0x8000 | 0x8004) && lparam != 0 && *(lparam as *const u32).add(1) == 2) => {
+        0x219
+            if wparam == 7
+                || (matches!(wparam, 0x8000 | 0x8004)
+                    && lparam != 0
+                    && *(lparam as *const u32).add(1) == 2) =>
+        {
             SetTimer(window, DEVICE_TIMER, 400, null_mut());
             return 1;
         }
@@ -943,6 +1338,7 @@ unsafe extern "system" fn procedure(
                 0x40,
             );
         }
+        0x10 if MOUNTED_DISKS.with_borrow(|disks| !disks.is_empty()) => eject_linux(window, true),
         2 => PostQuitMessage(0),
         _ => return DefWindowProcW(window, message, wparam, lparam),
     }

@@ -4,7 +4,7 @@ use std::ptr::null_mut;
 pub const MARGIN: i32 = 18;
 pub const PATHS_TOP: i32 = 123;
 pub const FILES_TOP: i32 = 249;
-pub const FOOTER_HEIGHT: i32 = 111;
+pub const FOOTER_HEIGHT: i32 = 132;
 
 pub const INK: u32 = rgb(20, 52, 83);
 pub const MUTED: u32 = rgb(56, 80, 105);
@@ -139,30 +139,22 @@ impl Theme {
         fill(dc, rect(0, footer, width, FOOTER_HEIGHT), PANEL);
         fill(dc, rect(0, footer, width, 1), LINE);
         fill(dc, rect(0, footer + 1, width, 1), WHITE);
-        label(
-            dc,
-            "I file già presenti vengono saltati.",
-            rect(MARGIN, footer + 11, width - 367, 33),
-            self.body,
-            MUTED,
-            0x24,
-        );
         fill(
             dc,
-            rect(MARGIN, footer + 53, width - 2 * MARGIN, FOOTER_HEIGHT - 62),
+            rect(MARGIN, footer + 72, width - 2 * MARGIN, FOOTER_HEIGHT - 81),
             LINE,
         );
         fill(
             dc,
             rect(
                 MARGIN + 1,
-                footer + 54,
+                footer + 73,
                 width - 2 * MARGIN - 2,
-                FOOTER_HEIGHT - 64,
+                FOOTER_HEIGHT - 83,
             ),
             WHITE,
         );
-        fill(dc, rect(MARGIN + 9, footer + 65, 7, 7), rgb(54, 137, 191));
+        fill(dc, rect(MARGIN + 9, footer + 84, 7, 7), rgb(54, 137, 191));
         SelectObject(dc, GetStockObject(17));
     }
 
